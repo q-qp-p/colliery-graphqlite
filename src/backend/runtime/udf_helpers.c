@@ -2751,6 +2751,7 @@ typedef struct {
     int capacity;
     double percentile;
     int have_percentile;
+    int out_of_range;
 } percentile_agg;
 
 static int percentile_cmp(const void *a, const void *b) {
@@ -2772,6 +2773,9 @@ static void percentile_step_common(sqlite3_context *ctx, int argc, sqlite3_value
     if (p_type == SQLITE_INTEGER || p_type == SQLITE_FLOAT) {
         agg->percentile = sqlite3_value_double(argv[1]);
         agg->have_percentile = 1;
+        if (agg->percentile < 0.0 || agg->percentile > 1.0) {
+            agg->out_of_range = 1;
+        }
     }
 
     /* Skip null input values per openCypher aggregate semantics. */
@@ -2796,17 +2800,18 @@ static void percentile_step_common(sqlite3_context *ctx, int argc, sqlite3_value
 
 static void percentile_cont_final(sqlite3_context *ctx) {
     percentile_agg *agg = (percentile_agg*)sqlite3_aggregate_context(ctx, 0);
+    if (agg && agg->out_of_range) {
+        sqlite3_result_error(ctx,
+            "ArgumentError: NumberOutOfRange: percentileCont: percentile must be in [0,1]", -1);
+        if (agg->values) sqlite3_free(agg->values);
+        return;
+    }
     if (!agg || agg->count == 0 || !agg->have_percentile) {
         sqlite3_result_null(ctx);
         if (agg && agg->values) sqlite3_free(agg->values);
         return;
     }
     double p = agg->percentile;
-    if (p < 0.0 || p > 1.0) {
-        sqlite3_result_error(ctx, "percentileCont: percentile must be in [0,1]", -1);
-        sqlite3_free(agg->values);
-        return;
-    }
     qsort(agg->values, agg->count, sizeof(double), percentile_cmp);
     int n = agg->count;
     double idx = p * (n - 1);
@@ -2825,17 +2830,18 @@ static void percentile_cont_final(sqlite3_context *ctx) {
 
 static void percentile_disc_final(sqlite3_context *ctx) {
     percentile_agg *agg = (percentile_agg*)sqlite3_aggregate_context(ctx, 0);
+    if (agg && agg->out_of_range) {
+        sqlite3_result_error(ctx,
+            "ArgumentError: NumberOutOfRange: percentileDisc: percentile must be in [0,1]", -1);
+        if (agg->values) sqlite3_free(agg->values);
+        return;
+    }
     if (!agg || agg->count == 0 || !agg->have_percentile) {
         sqlite3_result_null(ctx);
         if (agg && agg->values) sqlite3_free(agg->values);
         return;
     }
     double p = agg->percentile;
-    if (p < 0.0 || p > 1.0) {
-        sqlite3_result_error(ctx, "percentileDisc: percentile must be in [0,1]", -1);
-        sqlite3_free(agg->values);
-        return;
-    }
     qsort(agg->values, agg->count, sizeof(double), percentile_cmp);
     int n = agg->count;
     /* Nearest-rank: smallest index i in [0,n-1] such that (i+1)/n >= p.

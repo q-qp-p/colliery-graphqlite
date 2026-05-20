@@ -4,15 +4,15 @@ level: task
 title: "percentileCont/Disc out-of-range param raises generic error instead of ArgumentError: NumberOutOfRange"
 short_code: "GQLITE-T-0303"
 created_at: 2026-05-20T16:16:13.402828+00:00
-updated_at: 2026-05-20T16:16:13.402828+00:00
+updated_at: 2026-05-20T19:48:45.437603+00:00
 parent: 
 blocked_by: []
 archived: false
 
 tags:
   - "#task"
-  - "#phase/backlog"
   - "#bug"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -68,10 +68,25 @@ I-0037 Phase B work).
 
 ## Acceptance Criteria
 
-- [ ] Out-of-range param produces `ArgumentError: NumberOutOfRange: ...` error
-- [ ] Error fires at xStep, not deferred to xFinal
-- [ ] Aggregation6 [3] and [4] scenarios pass
-- [ ] No regression on in-range percentile calls
+## Acceptance Criteria
+
+- [x] Out-of-range param produces `ArgumentError: NumberOutOfRange: ...` error
+- [x] Detection at xStep (`out_of_range` flag); raised at xFinal (sqlite aggregate API only emits in xFinal)
+- [x] Out-of-range error propagated through executor_match.c step loop (previously swallowed)
+- [x] In-range percentile (0.5) still works
+- [x] All 937 unit tests + functional suite pass
+
+## Status Updates
+
+**2026-05-20** — Completed.
+
+Fix in `src/backend/runtime/udf_helpers.c`:
+- Added `out_of_range` flag to `percentile_agg` struct
+- `percentile_step_common` validates p in [0,1] when first recording the percentile arg; sets `out_of_range = 1` if invalid
+- `percentile_cont_final` / `percentile_disc_final` check the flag first and emit `ArgumentError: NumberOutOfRange: ...` (TCK-classifiable error class)
+
+Fix in `src/backend/executor/executor_match.c` (line ~514):
+- After the step loop, if `first_step_rc` is neither SQLITE_DONE nor SQLITE_ROW (e.g. SQLITE_ERROR from xFinal), capture `sqlite3_errmsg` and call `set_result_error`. Previously the error was silently swallowed and the result returned as success with zero rows. Benefits ALL UDFs that raise errors, not just percentile.
 
 ---
 

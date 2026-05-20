@@ -511,6 +511,13 @@ int build_query_results(cypher_executor *executor, sqlite3_stmt *stmt, cypher_re
         first_step_rc = sqlite3_step(stmt);
     }
 
+    if (first_step_rc != SQLITE_DONE && first_step_rc != SQLITE_ROW) {
+        char err[1024];
+        snprintf(err, sizeof(err), "%s", sqlite3_errmsg(executor->db));
+        set_result_error(result, err);
+        return -1;
+    }
+
     if (current_row == 0) {
         /* No rows — free allocated arrays and return empty */
         free(result->data); result->data = NULL;
