@@ -58,6 +58,8 @@ static bool ast_yields_boolean(ast_node *expr)
         expr->type == AST_NODE_NULL_CHECK ||
         expr->type == AST_NODE_LIST_PREDICATE ||
         expr->type == AST_NODE_EXISTS_EXPR) return true;
+    if (expr->type == AST_NODE_LITERAL &&
+        ((cypher_literal*)expr)->literal_type == LITERAL_BOOLEAN) return true;
     if (expr->type == AST_NODE_BINARY_OP) {
         switch (((cypher_binary_op*)expr)->op_type) {
             case BINARY_OP_AND: case BINARY_OP_OR: case BINARY_OP_XOR:
@@ -79,9 +81,16 @@ static bool ast_yields_boolean(ast_node *expr)
 /* Emit an expression that participates in a JSON list/map. For
  * boolean-producing AST nodes, wrap in _gql_bool_str(...) so the
  * carried GQL_SUBTYPE_BOOLEAN survives through _gql_list/_gql_map.
- * Otherwise behaves like a normal transform_expression call. */
+ * For boolean LITERALs we emit the static text directly. Otherwise
+ * behaves like a normal transform_expression call. */
 static int transform_list_item_value(cypher_transform_context *ctx, ast_node *expr)
 {
+    if (expr && expr->type == AST_NODE_LITERAL &&
+        ((cypher_literal*)expr)->literal_type == LITERAL_BOOLEAN) {
+        cypher_literal *lit = (cypher_literal*)expr;
+        append_sql(ctx, "_gql_bool_str(%d)", lit->value.boolean ? 1 : 0);
+        return 0;
+    }
     if (ast_yields_boolean(expr)) {
         append_sql(ctx, "_gql_bool_str(CASE WHEN (");
         if (transform_expression(ctx, expr) < 0) return -1;
@@ -1132,13 +1141,7 @@ int transform_expression(cypher_transform_context *ctx, ast_node *expr)
                         append_string_literal(ctx, lit->value.string);
                         break;
                     case LITERAL_BOOLEAN:
-                        /* Wrap the literal in _gql_bool_str so it carries
-                         * GQL_SUBTYPE_BOOLEAN downstream. _gql_list /
-                         * _gql_map and the JSON renderer use that subtype
-                         * to emit JSON `true`/`false` instead of `1`/`0`
-                         * (T-0304). */
-                        append_sql(ctx, "_gql_bool_str(%d)",
-                                   lit->value.boolean ? 1 : 0);
+                        append_sql(ctx, "%d", lit->value.boolean ? 1 : 0);
                         break;
                     case LITERAL_NULL:
                         append_sql(ctx, "NULL");

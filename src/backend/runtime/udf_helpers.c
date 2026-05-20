@@ -2904,14 +2904,14 @@ void gql_percentile_disc_final(sqlite3_context *ctx) {
 
 static bool gql_value_looks_like_json(const char *s, int subtype) {
     if (!s) return false;
-    if (subtype == GQL_SUBTYPE_JSON) return true;
-    /* Heuristic: SQLite's json functions don't always propagate the
-     * subtype in older builds, so sniff the first non-space character.
-     * Cypher-side string literals are emitted as quoted SQL text and
-     * arrive without a leading bracket/brace, so this only catches
-     * intentional JSON containers. */
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-    return (*s == '[' || *s == '{');
+    /* Strict: only embed raw when the value is explicitly JSON-tagged
+     * (subtype 0x4A). Heuristic sniffing on the first character would
+     * mis-classify user string literals like ' [ a ' as JSON and
+     * corrupt the output (Literals7 [17] / Literals8 [17]). Anything
+     * that legitimately needs embedding flows through json_array /
+     * json_object / _gql_list / _gql_map, which all set
+     * GQL_SUBTYPE_JSON on their results. */
+    return subtype == GQL_SUBTYPE_JSON;
 }
 
 static void gql_json_append_value(dynamic_buffer *out,
