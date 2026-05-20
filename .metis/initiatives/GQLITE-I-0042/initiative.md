@@ -4,14 +4,14 @@ level: initiative
 title: "Executor finalize-sequencing refactor — defer SQL serialization until all clauses transformed"
 short_code: "GQLITE-I-0042"
 created_at: 2026-05-20T14:19:21.169084+00:00
-updated_at: 2026-05-20T14:19:21.169084+00:00
+updated_at: 2026-05-20T22:59:18.500180+00:00
 parent: GQLITE-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/discovery"
+  - "#phase/design"
 
 
 exit_criteria_met: false

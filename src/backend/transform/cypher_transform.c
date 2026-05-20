@@ -302,6 +302,16 @@ int finalize_sql_generation(cypher_transform_context *ctx)
         return 0;
     }
 
+    /* I-0042 E1: sql_builder_to_string is idempotent (returns NULL on
+     * second call). The existing transform pipeline calls this function
+     * multiple times for the same builder (e.g. once at the end of
+     * transform_return_clause, again from the executor before
+     * prepare/exec), and each call expects fresh SQL reflecting the
+     * current builder state. Explicitly unfinalize before serializing
+     * so the existing behavior is preserved. New callers that want
+     * true single-emit can call sql_builder_to_string directly. */
+    sql_builder_unfinalize(ctx->unified_builder);
+
     /* Assemble unified builder content into sql_buffer
      * For UNION queries (in_union=true), we append to accumulate branches
      * For regular queries, we reset the buffer first

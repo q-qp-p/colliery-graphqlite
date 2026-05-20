@@ -333,6 +333,16 @@ void sql_builder_reset(sql_builder *b)
 }
 
 /*
+ * Clear the finalized flag (I-0042 E1) so a subsequent call to
+ * sql_builder_to_string emits again. Use when state has been added
+ * after a previous finalize.
+ */
+void sql_builder_unfinalize(sql_builder *b)
+{
+    if (b) b->finalized = false;
+}
+
+/*
  * Add a SELECT expression.
  */
 void sql_select(sql_builder *b, const char *expr, const char *alias)
@@ -569,6 +579,20 @@ void sql_raw(sql_builder *b, const char *fmt, ...)
 char *sql_builder_to_string(sql_builder *b)
 {
     if (!b) return NULL;
+
+    /* I-0042 E1: idempotent finalize. Once a builder has been
+     * serialized, subsequent calls return NULL until the builder is
+     * explicitly reset (sql_builder_reset). Callers that legitimately
+     * need to re-serialize after additional state changes must
+     * either:
+     *   1. call sql_builder_reset(b) and rebuild, or
+     *   2. call sql_builder_unfinalize(b) to clear the flag in place.
+     * This protects against accidental double-finalize that would
+     * append the same SQL twice into ctx->sql_buffer via
+     * finalize_sql_generation. */
+    if (b->finalized) {
+        return NULL;
+    }
 
     /* Need at least SELECT items or FROM clause */
     if (b->select_count == 0 && dbuf_is_empty(&b->from)) {

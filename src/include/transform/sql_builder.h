@@ -188,6 +188,14 @@ void sql_builder_free(sql_builder *b);
 void sql_builder_reset(sql_builder *b);
 
 /*
+ * Clear the finalized flag in place (I-0042 E1). Use when the caller
+ * has appended additional state (joins, WHERE conditions, etc.) and
+ * needs to re-emit. Does NOT clear any buffers; sql_builder_to_string
+ * will re-serialize the current state, including the new additions.
+ */
+void sql_builder_unfinalize(sql_builder *b);
+
+/*
  * Add a SELECT expression.
  * expr: The expression (e.g., "n.id", "COUNT(*)")
  * alias: Optional alias (e.g., "node_id"), may be NULL

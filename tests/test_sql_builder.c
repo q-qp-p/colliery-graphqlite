@@ -671,6 +671,59 @@ static void test_sql_builder_pre_cte_to_string_excludes(void)
     sql_builder_free(b);
 }
 
+/* I-0042 E1: idempotent sql_builder_to_string. */
+static void test_sql_builder_to_string_idempotent(void)
+{
+    sql_builder *b = sql_builder_create();
+    CU_ASSERT_PTR_NOT_NULL(b);
+    if (!b) return;
+
+    sql_select(b, "n.id", NULL);
+    sql_from(b, "nodes", "n");
+
+    char *first = sql_builder_to_string(b);
+    CU_ASSERT_PTR_NOT_NULL(first);
+    CU_ASSERT_TRUE(b->finalized);
+
+    /* Second call must return NULL — protects against double-finalize. */
+    char *second = sql_builder_to_string(b);
+    CU_ASSERT_PTR_NULL(second);
+
+    /* After unfinalize, third call emits the same content again. */
+    sql_builder_unfinalize(b);
+    CU_ASSERT_FALSE(b->finalized);
+    char *third = sql_builder_to_string(b);
+    CU_ASSERT_PTR_NOT_NULL(third);
+    if (first && third) {
+        CU_ASSERT_STRING_EQUAL(first, third);
+    }
+
+    free(first); free(third);
+    sql_builder_free(b);
+}
+
+static void test_sql_builder_reset_clears_finalized(void)
+{
+    sql_builder *b = sql_builder_create();
+    CU_ASSERT_PTR_NOT_NULL(b);
+    if (!b) return;
+
+    sql_select(b, "1", NULL);
+    char *s = sql_builder_to_string(b);
+    free(s);
+    CU_ASSERT_TRUE(b->finalized);
+
+    sql_builder_reset(b);
+    CU_ASSERT_FALSE(b->finalized);
+
+    sql_select(b, "2", NULL);
+    char *s2 = sql_builder_to_string(b);
+    CU_ASSERT_PTR_NOT_NULL(s2);
+    if (s2) CU_ASSERT(strstr(s2, "SELECT 2") != NULL);
+    free(s2);
+    sql_builder_free(b);
+}
+
 /* Test reset */
 static void test_sql_builder_reset(void)
 {
@@ -1174,6 +1227,8 @@ int init_sql_builder_suite(void)
     if (!CU_add_test(suite, "sql: pre_cte recursive flag", test_sql_builder_pre_cte_recursive)) return -1;
     if (!CU_add_test(suite, "sql: pre_cte reset", test_sql_builder_pre_cte_reset)) return -1;
     if (!CU_add_test(suite, "sql: pre_cte not in to_string", test_sql_builder_pre_cte_to_string_excludes)) return -1;
+    if (!CU_add_test(suite, "sql: to_string idempotent", test_sql_builder_to_string_idempotent)) return -1;
+    if (!CU_add_test(suite, "sql: reset clears finalized", test_sql_builder_reset_clears_finalized)) return -1;
     if (!CU_add_test(suite, "sql: Reset", test_sql_builder_reset)) return -1;
     if (!CU_add_test(suite, "sql: Empty returns NULL", test_sql_builder_empty_returns_null)) return -1;
     if (!CU_add_test(suite, "sql: Complex query", test_sql_builder_complex)) return -1;
