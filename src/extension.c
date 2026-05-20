@@ -301,10 +301,28 @@ static void graphqlite_cypher_func(sqlite3_context *context, int argc, sqlite3_v
                         if (val[0] == '[' || val[0] == '{' || val[0] == '"') {
                             size_t slen = strlen(val);
                             if (offset + slen < buffer_size) { memcpy(json_result + offset, val, slen); offset += slen; }
-                        } else if (col_type == SQLITE_INTEGER || col_type == SQLITE_FLOAT) {
-                            /* Numeric value - output without quotes */
+                        } else if (col_type == SQLITE_INTEGER) {
                             size_t slen = strlen(val);
                             if (offset + slen < buffer_size) { memcpy(json_result + offset, val, slen); offset += slen; }
+                        } else if (col_type == SQLITE_FLOAT) {
+                            /* Cypher distinguishes Float from Integer in result
+                             * type. Whole-number floats must render with a
+                             * trailing ".0" so 20.0 doesn't look like the
+                             * integer 20. Append ".0" if val has no decimal
+                             * point or exponent marker. */
+                            size_t slen = strlen(val);
+                            if (offset + slen < buffer_size) {
+                                memcpy(json_result + offset, val, slen);
+                                offset += slen;
+                            }
+                            bool has_frac = false;
+                            for (const char *p = val; *p; p++) {
+                                if (*p == '.' || *p == 'e' || *p == 'E') { has_frac = true; break; }
+                            }
+                            if (!has_frac && offset + 2 < buffer_size) {
+                                json_result[offset++] = '.';
+                                json_result[offset++] = '0';
+                            }
                         } else if (col_type == GQL_COL_TYPE_BOOLEAN) {
                             /* UDF-tagged boolean — emit unquoted JSON
                              * true/false. Replaces the historical
