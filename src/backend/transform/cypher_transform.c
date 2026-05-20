@@ -328,38 +328,65 @@ int finalize_sql_generation(cypher_transform_context *ctx)
 void prepend_cte_to_sql(cypher_transform_context *ctx)
 {
     if (!ctx) return;
+    if (!ctx->unified_builder) return;
 
-    /* Check for CTEs from unified builder */
-    if (!ctx->unified_builder || dbuf_is_empty(&ctx->unified_builder->cte)) {
-        return;
+    sql_builder *b = ctx->unified_builder;
+    bool has_pre = b->pre_cte_count > 0;
+    bool has_user = !dbuf_is_empty(&b->cte);
+    if (!has_pre && !has_user) return;
+
+    /* Build the prepend prefix: a single WITH clause carrying pre_cte
+     * fragments first, then the user-CTE fragments (which arrive with
+     * their own leading "WITH"/"WITH RECURSIVE"). We strip the
+     * embedded WITH from the user buffer and emit a unified header. */
+    dynamic_buffer prefix; dbuf_init(&prefix);
+
+    bool any_recursive = b->pre_cte_recursive;
+    /* Detect "WITH RECURSIVE" prefix in the user CTE buffer. */
+    const char *user_cte = has_user ? dbuf_get(&b->cte) : "";
+    const char *user_body = user_cte;
+    if (has_user) {
+        if (strncmp(user_cte, "WITH RECURSIVE ", 15) == 0) {
+            any_recursive = true;
+            user_body = user_cte + 15;
+        } else if (strncmp(user_cte, "WITH ", 5) == 0) {
+            user_body = user_cte + 5;
+        }
     }
 
-    const char *cte_str = dbuf_get(&ctx->unified_builder->cte);
-    size_t cte_len = dbuf_len(&ctx->unified_builder->cte);
+    dbuf_append(&prefix, any_recursive ? "WITH RECURSIVE " : "WITH ");
+    if (has_pre) {
+        dbuf_append(&prefix, dbuf_get(&b->pre_cte));
+    }
+    if (has_user) {
+        if (has_pre) dbuf_append(&prefix, ", ");
+        dbuf_append(&prefix, user_body);
+    }
+    dbuf_append_char(&prefix, ' ');
 
-    CYPHER_DEBUG("Prepending CTEs to SQL (%zu bytes)", cte_len);
+    const char *prefix_str = dbuf_get(&prefix);
+    size_t prefix_len = dbuf_len(&prefix);
 
-    /* Calculate new size needed: CTE + space + SQL + null */
-    size_t new_size = cte_len + 1 + ctx->sql_size + 1;
+    CYPHER_DEBUG("Prepending CTEs (pre_cte=%d, user_cte=%zu) to SQL",
+                 b->pre_cte_count, has_user ? dbuf_len(&b->cte) : 0);
 
-    /* Allocate new buffer */
+    size_t new_size = prefix_len + ctx->sql_size + 1;
     char *new_buffer = malloc(new_size);
     if (!new_buffer) {
         ctx->has_error = true;
         ctx->error_message = strdup("Memory allocation failed during CTE prepend");
+        dbuf_free(&prefix);
         return;
     }
+    memcpy(new_buffer, prefix_str, prefix_len);
+    memcpy(new_buffer + prefix_len, ctx->sql_buffer, ctx->sql_size + 1);
 
-    /* Copy CTE, space, and SQL */
-    memcpy(new_buffer, cte_str, cte_len);
-    new_buffer[cte_len] = ' ';
-    memcpy(new_buffer + cte_len + 1, ctx->sql_buffer, ctx->sql_size + 1);
-
-    /* Replace old buffer */
     free(ctx->sql_buffer);
     ctx->sql_buffer = new_buffer;
-    ctx->sql_size = cte_len + 1 + ctx->sql_size;
+    ctx->sql_size = prefix_len + ctx->sql_size;
     ctx->sql_capacity = new_size;
+
+    dbuf_free(&prefix);
 
     CYPHER_DEBUG("New SQL after CTE prepend: %s", ctx->sql_buffer);
 }

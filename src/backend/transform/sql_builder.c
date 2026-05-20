@@ -254,6 +254,7 @@ sql_builder *sql_builder_create(void)
     sql_builder *b = calloc(1, sizeof(sql_builder));
     if (!b) return NULL;
 
+    dbuf_init(&b->pre_cte);
     dbuf_init(&b->cte);
     dbuf_init(&b->select);
     dbuf_init(&b->from);
@@ -267,6 +268,8 @@ sql_builder *sql_builder_create(void)
     b->offset = -1;
     b->select_count = 0;
     b->cte_count = 0;
+    b->pre_cte_count = 0;
+    b->pre_cte_recursive = false;
     b->where_count = 0;
     b->group_count = 0;
     b->order_count = 0;
@@ -282,6 +285,7 @@ void sql_builder_free(sql_builder *b)
 {
     if (!b) return;
 
+    dbuf_free(&b->pre_cte);
     dbuf_free(&b->cte);
     dbuf_free(&b->select);
     dbuf_free(&b->from);
@@ -303,6 +307,7 @@ void sql_builder_reset(sql_builder *b)
 {
     if (!b) return;
 
+    dbuf_clear(&b->pre_cte);
     dbuf_clear(&b->cte);
     dbuf_clear(&b->select);
     dbuf_clear(&b->from);
@@ -318,6 +323,8 @@ void sql_builder_reset(sql_builder *b)
     b->offset = -1;
     b->select_count = 0;
     b->cte_count = 0;
+    b->pre_cte_count = 0;
+    b->pre_cte_recursive = false;
     b->where_count = 0;
     b->group_count = 0;
     b->order_count = 0;
@@ -520,6 +527,25 @@ void sql_cte(sql_builder *b, const char *name, const char *query, bool recursive
 }
 
 /*
+ * Add a pre-CTE definition (T-0267). Pre-CTEs appear in the final SQL
+ * before any sql_cte() entries. Stored as raw "name AS (query)"
+ * fragments separated by ", " — sql_builder_to_string is responsible
+ * for emitting the WITH/WITH RECURSIVE keyword and merging with user
+ * CTEs into a single WITH clause.
+ */
+void sql_pre_cte(sql_builder *b, const char *name, const char *query, bool recursive)
+{
+    if (!b || !name || !query) return;
+
+    if (b->pre_cte_count > 0) {
+        dbuf_append(&b->pre_cte, ", ");
+    }
+    dbuf_appendf(&b->pre_cte, "%s AS (%s)", name, query);
+    b->pre_cte_count++;
+    if (recursive) b->pre_cte_recursive = true;
+}
+
+/*
  * Append a printf-formatted fragment into raw_output. Emitted after
  * the typed SELECT sections in sql_builder_to_string. (I-0039 Ext A.)
  */
@@ -552,8 +578,10 @@ char *sql_builder_to_string(sql_builder *b)
     dynamic_buffer result;
     dbuf_init(&result);
 
-    /* NOTE: CTEs are intentionally NOT included here.
-     * They are handled by prepend_cte_to_sql() at the end. */
+    /* NOTE: CTEs (both pre_cte and cte) are intentionally NOT included
+     * here. They are emitted by prepend_cte_to_sql() at the end of
+     * transformation, which fuses pre_cte (T-0267) and the user CTE
+     * buffer into a single WITH clause. */
 
     /* SELECT */
     if (b->distinct) {
