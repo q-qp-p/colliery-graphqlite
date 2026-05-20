@@ -187,6 +187,19 @@ int graphqlite_register_helper_udfs(sqlite3 *db)
                          0, gql_percentile_disc_step, gql_percentile_disc_final);
   if (rc != SQLITE_OK) return rc;
 
+  /* T-0304: JSON array/object constructors that honor GQL_SUBTYPE_BOOLEAN
+   * (and tag their own output with the JSON subtype for proper nesting).
+   * Variadic — nargs = -1. */
+  rc = sqlite3_create_function(db, "_gql_list", -1,
+                         SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_RESULT_SUBTYPE, 0,
+                         gql_list_func, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
+  rc = sqlite3_create_function(db, "_gql_map", -1,
+                         SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_RESULT_SUBTYPE, 0,
+                         gql_map_func, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
   return SQLITE_OK;
 }
 

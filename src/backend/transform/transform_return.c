@@ -47,6 +47,52 @@ const char* get_pending_prop_joins(cypher_transform_context *ctx)
     return ctx->pending_prop_joins ? ctx->pending_prop_joins : "";
 }
 
+/* Whether an AST node is a boolean-producing expression. Mirrors the
+ * predicate at the top-of-RETURN-item wrap site below. Used when
+ * emitting list/map values so booleans inside literals get tagged
+ * with GQL_SUBTYPE_BOOLEAN (T-0304). */
+static bool ast_yields_boolean(ast_node *expr)
+{
+    if (!expr) return false;
+    if (expr->type == AST_NODE_NOT_EXPR ||
+        expr->type == AST_NODE_NULL_CHECK ||
+        expr->type == AST_NODE_LIST_PREDICATE ||
+        expr->type == AST_NODE_EXISTS_EXPR) return true;
+    if (expr->type == AST_NODE_BINARY_OP) {
+        switch (((cypher_binary_op*)expr)->op_type) {
+            case BINARY_OP_AND: case BINARY_OP_OR: case BINARY_OP_XOR:
+            case BINARY_OP_EQ:  case BINARY_OP_NEQ:
+            case BINARY_OP_LT:  case BINARY_OP_GT:
+            case BINARY_OP_LTE: case BINARY_OP_GTE:
+            case BINARY_OP_IN:
+            case BINARY_OP_STARTS_WITH:
+            case BINARY_OP_ENDS_WITH:
+            case BINARY_OP_CONTAINS:
+            case BINARY_OP_REGEX_MATCH:
+                return true;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+/* Emit an expression that participates in a JSON list/map. For
+ * boolean-producing AST nodes, wrap in _gql_bool_str(...) so the
+ * carried GQL_SUBTYPE_BOOLEAN survives through _gql_list/_gql_map.
+ * Otherwise behaves like a normal transform_expression call. */
+static int transform_list_item_value(cypher_transform_context *ctx, ast_node *expr)
+{
+    if (ast_yields_boolean(expr)) {
+        append_sql(ctx, "_gql_bool_str(CASE WHEN (");
+        if (transform_expression(ctx, expr) < 0) return -1;
+        append_sql(ctx, ") IS NULL THEN NULL WHEN (");
+        if (transform_expression(ctx, expr) < 0) return -1;
+        append_sql(ctx, ") THEN 1 ELSE 0 END)");
+        return 0;
+    }
+    return transform_expression(ctx, expr);
+}
+
 size_t get_pending_prop_joins_len(cypher_transform_context *ctx)
 {
     return ctx->pending_prop_joins_len;
@@ -1086,7 +1132,13 @@ int transform_expression(cypher_transform_context *ctx, ast_node *expr)
                         append_string_literal(ctx, lit->value.string);
                         break;
                     case LITERAL_BOOLEAN:
-                        append_sql(ctx, "%d", lit->value.boolean ? 1 : 0);
+                        /* Wrap the literal in _gql_bool_str so it carries
+                         * GQL_SUBTYPE_BOOLEAN downstream. _gql_list /
+                         * _gql_map and the JSON renderer use that subtype
+                         * to emit JSON `true`/`false` instead of `1`/`0`
+                         * (T-0304). */
+                        append_sql(ctx, "_gql_bool_str(%d)",
+                                   lit->value.boolean ? 1 : 0);
                         break;
                     case LITERAL_NULL:
                         append_sql(ctx, "NULL");
@@ -1112,15 +1164,18 @@ int transform_expression(cypher_transform_context *ctx, ast_node *expr)
 
         case AST_NODE_LIST:
             {
-                /* Transform list to JSON array for SQLite */
+                /* Transform list to JSON array using _gql_list (T-0304):
+                 * honors GQL_SUBTYPE_BOOLEAN so [true, false] renders as
+                 * [true, false] rather than [1, 0], and tags its output
+                 * with the JSON subtype so nested lists embed cleanly. */
                 cypher_list *list = (cypher_list*)expr;
-                append_sql(ctx, "json_array(");
+                append_sql(ctx, "_gql_list(");
                 if (list->items) {
                     for (int i = 0; i < list->items->count; i++) {
                         if (i > 0) {
                             append_sql(ctx, ", ");
                         }
-                        if (transform_expression(ctx, list->items->items[i]) < 0) {
+                        if (transform_list_item_value(ctx, list->items->items[i]) < 0) {
                             return -1;
                         }
                     }
@@ -1187,19 +1242,19 @@ int transform_expression(cypher_transform_context *ctx, ast_node *expr)
 
         case AST_NODE_MAP:
             {
-                /* Transform map literal to SQLite json_object() */
+                /* Transform map literal using _gql_map (T-0304): honors
+                 * GQL_SUBTYPE_BOOLEAN for values and tags result with
+                 * the JSON subtype. */
                 cypher_map *map = (cypher_map*)expr;
-                append_sql(ctx, "json_object(");
+                append_sql(ctx, "_gql_map(");
                 if (map->pairs) {
                     for (int i = 0; i < map->pairs->count; i++) {
                         if (i > 0) {
                             append_sql(ctx, ", ");
                         }
                         cypher_map_pair *pair = (cypher_map_pair*)map->pairs->items[i];
-                        /* Key as string */
                         append_sql(ctx, "'%s', ", pair->key);
-                        /* Value expression */
-                        if (transform_expression(ctx, pair->value) < 0) {
+                        if (transform_list_item_value(ctx, pair->value) < 0) {
                             return -1;
                         }
                     }

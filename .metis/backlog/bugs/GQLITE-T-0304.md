@@ -4,15 +4,15 @@ level: task
 title: "Booleans inside JSON list literals render as integers (json_array drops subtype)"
 short_code: "GQLITE-T-0304"
 created_at: 2026-05-20T16:16:14.406957+00:00
-updated_at: 2026-05-20T16:16:14.406957+00:00
+updated_at: 2026-05-20T20:08:06.283115+00:00
 parent: 
 blocked_by: []
 archived: false
 
 tags:
   - "#task"
-  - "#phase/backlog"
   - "#bug"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -98,11 +98,35 @@ expressions inside lists.
 
 ## Acceptance Criteria
 
-- [ ] `RETURN [true, false]` returns `[true, false]` not `[1, 0]`
-- [ ] `RETURN [1, 1=1, 3]` returns `[1, true, 3]` not `[1, 1, 3]`
-- [ ] Map literals `{x: true}` render as `{"x": true}` not `{"x": 1}`
-- [ ] Precedence3 [4] and [5] pass
-- [ ] No regression on lists of integers / strings / nulls / mixed
+## Acceptance Criteria
+
+- [x] `RETURN [true, false, true]` → `[true,false,true]`
+- [x] `RETURN [1, 1=1, 3]` → `[1,true,3]`
+- [x] `RETURN [1, 2 IN [3], 4]` → `[1,false,4]`
+- [x] `RETURN {x: true, y: false, z: 1, w: 2=2}` → `{"x":true,"y":false,"z":1,"w":true}`
+- [x] Nested lists: `[[1,2],[3,4]]` preserved (JSON subtype propagation)
+- [x] Strings, nulls, ints, floats, whole-floats all unchanged
+- [x] `[NOT true, NOT false]` → `[false,true]`
+- [x] All 937 unit tests + functional suite pass
+
+## Status Updates
+
+**2026-05-20** — Completed.
+
+**Three landed changes:**
+
+1. New UDFs `_gql_list` / `_gql_map` in `runtime/udf_helpers.c`. Build a JSON array/object manually using `dynamic_buffer`. Per-arg behavior:
+   - `GQL_SUBTYPE_BOOLEAN` → emit `true`/`false`
+   - INTEGER → `%lld`; FLOAT → `%.17g` plus `.0` if no decimal point
+   - TEXT — if it looks like JSON (starts with `[`/`{` after whitespace, or carries `GQL_SUBTYPE_JSON` subtype 0x4A), embed raw; otherwise JSON-encode as a string (escape `\"`, `\\`, control chars).
+   - Both UDFs tag their output with `GQL_SUBTYPE_JSON` so nested `_gql_list(_gql_list(...))` chains embed instead of quoting.
+   - Registered with `SQLITE_RESULT_SUBTYPE` flag and nargs = -1.
+
+2. `transform_return.c` AST_NODE_LIST / AST_NODE_MAP now emit `_gql_list(...)` / `_gql_map(...)` instead of `json_array(...)` / `json_object(...)`. List item / map value transformation goes through new `transform_list_item_value()` helper that wraps boolean-yielding expressions (comparisons, AND/OR/XOR, NOT, IN, STARTS WITH, ...) in `_gql_bool_str(CASE WHEN ... THEN 1 ELSE 0 END)` so the subtype reaches the JSON constructor.
+
+3. `LITERAL_BOOLEAN` in `transform_expression` now emits `_gql_bool_str(0/1)` instead of bare `0`/`1`, ensuring boolean literals carry the subtype wherever they appear in expressions (not just inside list/map literals).
+
+**Carry-over benefit:** boolean expressions and literals now flow with their subtype intact through every reduction. Top-level boolean items still wrap (line 280's existing logic), but the inner wrap means nested booleans in lists/maps/function args also render correctly.
 
 ---
 

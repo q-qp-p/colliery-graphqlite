@@ -29,6 +29,16 @@
 #include "parser/cypher_parser.h"
 #include "parser/cypher_debug.h"
 #include "runtime/gql_error.h"
+#include "transform/sql_builder.h"
+
+/* SQLite's JSON subtype marker (added in 3.45). Matches the 'J' char =
+ * 0x4A used by json_array/json_object to flag JSON-typed text results
+ * so json_array(json_array(...)) embeds the inner array instead of
+ * quoting it. Define locally to avoid a hard dep on a specific SQLite
+ * version. */
+#ifndef GQL_SUBTYPE_JSON
+#define GQL_SUBTYPE_JSON 0x4A
+#endif
 
 /* Definition of the structured-error helper declared in gql_error.h. */
 void graphqlite_result_error(sqlite3_context *context,
@@ -2876,4 +2886,133 @@ void gql_percentile_disc_step(sqlite3_context *ctx, int argc, sqlite3_value **ar
 }
 void gql_percentile_disc_final(sqlite3_context *ctx) {
     percentile_disc_final(ctx);
+}
+
+/* =============================================================================
+ * _gql_list / _gql_map — JSON array/object constructors that honor the
+ * boolean subtype.
+ *
+ * SQLite's native json_array / json_object preserve nested-JSON values
+ * (via the JSON subtype tag) but cannot distinguish a Cypher Boolean
+ * stored as int 0/1 from the integer 0/1. The result is `[true]` being
+ * rendered as `[1]`. These UDFs intercept boolean-subtype arguments and
+ * emit the JSON tokens `true`/`false`, deferring to standard formatting
+ * for everything else. They also tag their result with the JSON subtype
+ * so nested `_gql_list(_gql_list(...))` embeds correctly.
+ * =============================================================================
+ */
+
+static bool gql_value_looks_like_json(const char *s, int subtype) {
+    if (!s) return false;
+    if (subtype == GQL_SUBTYPE_JSON) return true;
+    /* Heuristic: SQLite's json functions don't always propagate the
+     * subtype in older builds, so sniff the first non-space character.
+     * Cypher-side string literals are emitted as quoted SQL text and
+     * arrive without a leading bracket/brace, so this only catches
+     * intentional JSON containers. */
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    return (*s == '[' || *s == '{');
+}
+
+static void gql_json_append_value(dynamic_buffer *out,
+                                  sqlite3_value *v) {
+    int t = sqlite3_value_type(v);
+    int st = sqlite3_value_subtype(v);
+    if (st == GQL_SUBTYPE_BOOLEAN) {
+        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+            dbuf_append(out, sqlite3_value_int64(v) ? "true" : "false");
+        } else if (t == SQLITE_TEXT) {
+            const char *s = (const char*)sqlite3_value_text(v);
+            dbuf_append(out, (s && strcmp(s, "true") == 0) ? "true" : "false");
+        } else {
+            dbuf_append(out, "null");
+        }
+        return;
+    }
+    if (t == SQLITE_NULL) { dbuf_append(out, "null"); return; }
+    if (t == SQLITE_INTEGER) {
+        dbuf_appendf(out, "%lld", (long long)sqlite3_value_int64(v));
+        return;
+    }
+    if (t == SQLITE_FLOAT) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%.17g", sqlite3_value_double(v));
+        dbuf_append(out, buf);
+        bool has_frac = false;
+        for (const char *p = buf; *p; p++) {
+            if (*p == '.' || *p == 'e' || *p == 'E') { has_frac = true; break; }
+        }
+        if (!has_frac) dbuf_append(out, ".0");
+        return;
+    }
+    /* TEXT or BLOB */
+    const char *s = (const char*)sqlite3_value_text(v);
+    if (!s) { dbuf_append(out, "null"); return; }
+    if (gql_value_looks_like_json(s, st)) {
+        dbuf_append(out, s);
+        return;
+    }
+    /* JSON-encode as string. */
+    dbuf_append_char(out, '"');
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '"':  dbuf_append(out, "\\\""); break;
+            case '\\': dbuf_append(out, "\\\\"); break;
+            case '\b': dbuf_append(out, "\\b"); break;
+            case '\f': dbuf_append(out, "\\f"); break;
+            case '\n': dbuf_append(out, "\\n"); break;
+            case '\r': dbuf_append(out, "\\r"); break;
+            case '\t': dbuf_append(out, "\\t"); break;
+            default:
+                if (c < 0x20) {
+                    dbuf_appendf(out, "\\u%04x", c);
+                } else {
+                    dbuf_append_char(out, (char)c);
+                }
+        }
+    }
+    dbuf_append_char(out, '"');
+}
+
+void gql_list_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    dynamic_buffer out; dbuf_init(&out);
+    dbuf_append_char(&out, '[');
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_append_char(&out, ',');
+        gql_json_append_value(&out, argv[i]);
+    }
+    dbuf_append_char(&out, ']');
+    sqlite3_result_text(ctx, dbuf_get(&out), (int)dbuf_len(&out), SQLITE_TRANSIENT);
+    sqlite3_result_subtype(ctx, GQL_SUBTYPE_JSON);
+    dbuf_free(&out);
+}
+
+void gql_map_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc & 1) {
+        sqlite3_result_error(ctx, "_gql_map: requires an even number of arguments (key, value, ...)", -1);
+        return;
+    }
+    dynamic_buffer out; dbuf_init(&out);
+    dbuf_append_char(&out, '{');
+    for (int i = 0; i < argc; i += 2) {
+        if (i > 0) dbuf_append_char(&out, ',');
+        /* Key — always emit as JSON string. */
+        const char *k = (const char*)sqlite3_value_text(argv[i]);
+        dbuf_append_char(&out, '"');
+        if (k) {
+            for (const char *p = k; *p; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') dbuf_append_char(&out, '\\');
+                dbuf_append_char(&out, (char)c);
+            }
+        }
+        dbuf_append_char(&out, '"');
+        dbuf_append_char(&out, ':');
+        gql_json_append_value(&out, argv[i + 1]);
+    }
+    dbuf_append_char(&out, '}');
+    sqlite3_result_text(ctx, dbuf_get(&out), (int)dbuf_len(&out), SQLITE_TRANSIENT);
+    sqlite3_result_subtype(ctx, GQL_SUBTYPE_JSON);
+    dbuf_free(&out);
 }

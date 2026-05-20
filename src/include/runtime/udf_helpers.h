@@ -60,4 +60,8 @@ void gql_percentile_cont_final(sqlite3_context *ctx);
 void gql_percentile_disc_step(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 void gql_percentile_disc_final(sqlite3_context *ctx);
 
+/* JSON constructors that honor GQL_SUBTYPE_BOOLEAN (T-0304). */
+void gql_list_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+void gql_map_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+
 #endif /* RUNTIME_UDF_HELPERS_H */
