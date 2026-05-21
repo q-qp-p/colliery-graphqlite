@@ -70,9 +70,31 @@ construction bug.
 
 ## Acceptance Criteria
 
-- [ ] Reproducer query parses and runs without "near '.':" error
-- [ ] No regression on existing OPTIONAL MATCH / WITH chain scenarios
-- [ ] At least the 5 TCK scenarios above flip from error → pass/fail
+- [x] Reproducer query parses and runs without "near '.':" error
+- [x] No regression on existing OPTIONAL MATCH / WITH chain scenarios
+- [x] 2 of 5 TCK scenarios flipped error → fail (Match7 [21]/[27])
+- [ ] Remaining 3 (Match4 [8], Match9 [6]/[7]) still error — they use variable-length relationships, a different code path (`generate_varlen_cte`)
+
+## Status Updates
+
+**2026-05-21** — Partial fix in commit 9cac9c6.
+
+The non-varlen `optional` path in `generate_relationship_match` had a
+`target_already_added` check that did `strstr(from, target_alias)`.
+When `target_alias` was a cross-clause column reference (`_with_0.a`)
+from a prior WITH projection, the substring search missed it because
+FROM/JOIN held only the CTE name `_with_0`.
+
+Added a check: if `target_node->variable` is a `VAR_KIND_PROJECTED`
+variable or has `alias_is_id` set (both indicate WITH-binding), treat
+target as already-attached. This skips the bogus
+`LEFT JOIN nodes AS _with_0.a ON _with_0.a.id = ...` emission.
+
+The 3 remaining var-length scenarios (Match4 [8], Match9 [6]/[7]) take
+a different code path (`generate_varlen_cte` and its CTE-style join
+construction) that has the same alias-mishandling issue. Filing as
+follow-on work in this same ticket — the source-side and var-length
+analog need similar `alias_is_id`-aware skipping.
 
 ## Discovered
 
