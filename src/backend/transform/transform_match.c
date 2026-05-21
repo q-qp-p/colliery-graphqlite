@@ -183,23 +183,31 @@ int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
                                 dynamic_buffer cond;
                                 dbuf_init(&cond);
 
+                                /* T-0307 follow-on: use get_node_id_ref so a
+                                 * WITH-bound node's alias (a column reference
+                                 * like _with_0.a) is used directly instead of
+                                 * appending an invalid `.id` suffix. */
+                                char node_id_ref[256];
+                                snprintf(node_id_ref, sizeof(node_id_ref), "%s",
+                                         get_node_id_ref(ctx, alias, node->variable));
+
                                 if (lit->literal_type == LITERAL_NULL) {
                                     /* Key should not exist on the node (in any scalar table). */
                                     dbuf_appendf(&cond,
                                         "NOT EXISTS(SELECT 1 FROM node_props_text npt "
                                         "JOIN property_keys pk ON npt.key_id = pk.id "
-                                        "WHERE npt.node_id = %s.id AND pk.key = '%s') AND "
+                                        "WHERE npt.node_id = %s AND pk.key = '%s') AND "
                                         "NOT EXISTS(SELECT 1 FROM node_props_int npi "
                                         "JOIN property_keys pk ON npi.key_id = pk.id "
-                                        "WHERE npi.node_id = %s.id AND pk.key = '%s') AND "
+                                        "WHERE npi.node_id = %s AND pk.key = '%s') AND "
                                         "NOT EXISTS(SELECT 1 FROM node_props_real npr "
                                         "JOIN property_keys pk ON npr.key_id = pk.id "
-                                        "WHERE npr.node_id = %s.id AND pk.key = '%s') AND "
+                                        "WHERE npr.node_id = %s AND pk.key = '%s') AND "
                                         "NOT EXISTS(SELECT 1 FROM node_props_bool npb "
                                         "JOIN property_keys pk ON npb.key_id = pk.id "
-                                        "WHERE npb.node_id = %s.id AND pk.key = '%s')",
-                                        alias, pair->key, alias, pair->key,
-                                        alias, pair->key, alias, pair->key);
+                                        "WHERE npb.node_id = %s AND pk.key = '%s')",
+                                        node_id_ref, pair->key, node_id_ref, pair->key,
+                                        node_id_ref, pair->key, node_id_ref, pair->key);
                                 } else {
                                     const char *prop_table = "node_props_text";
                                     char value_sql[128];
@@ -233,8 +241,8 @@ int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
                                     dbuf_appendf(&cond,
                                         "EXISTS(SELECT 1 FROM %s t "
                                         "JOIN property_keys pk ON pk.id = t.key_id "
-                                        "WHERE t.node_id = %s.id AND pk.key = '%s' AND t.value = %s)",
-                                        prop_table, alias, pair->key, value_sql);
+                                        "WHERE t.node_id = %s AND pk.key = '%s' AND t.value = %s)",
+                                        prop_table, node_id_ref, pair->key, value_sql);
                                 }
 
                                 if (!dbuf_is_empty(&cond)) {
@@ -246,6 +254,9 @@ int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
                                 cypher_parameter *param = (cypher_parameter*)pair->value;
                                 dynamic_buffer cond;
                                 dbuf_init(&cond);
+                                char node_id_ref[256];
+                                snprintf(node_id_ref, sizeof(node_id_ref), "%s",
+                                         get_node_id_ref(ctx, alias, node->variable));
 
                                 /* Use OR conditions to check each property type table
                                  * This handles string, int, real, and bool params correctly */
@@ -254,24 +265,24 @@ int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
                                     /* String match */
                                     "EXISTS(SELECT 1 FROM node_props_text npt "
                                     "JOIN property_keys pk ON npt.key_id = pk.id "
-                                    "WHERE npt.node_id = %s.id AND pk.key = '%s' AND npt.value = :%s) OR "
+                                    "WHERE npt.node_id = %s AND pk.key = '%s' AND npt.value = :%s) OR "
                                     /* Integer match */
                                     "EXISTS(SELECT 1 FROM node_props_int npi "
                                     "JOIN property_keys pk ON npi.key_id = pk.id "
-                                    "WHERE npi.node_id = %s.id AND pk.key = '%s' AND npi.value = :%s) OR "
+                                    "WHERE npi.node_id = %s AND pk.key = '%s' AND npi.value = :%s) OR "
                                     /* Real match */
                                     "EXISTS(SELECT 1 FROM node_props_real npr "
                                     "JOIN property_keys pk ON npr.key_id = pk.id "
-                                    "WHERE npr.node_id = %s.id AND pk.key = '%s' AND npr.value = :%s) OR "
+                                    "WHERE npr.node_id = %s AND pk.key = '%s' AND npr.value = :%s) OR "
                                     /* Boolean match */
                                     "EXISTS(SELECT 1 FROM node_props_bool npb "
                                     "JOIN property_keys pk ON npb.key_id = pk.id "
-                                    "WHERE npb.node_id = %s.id AND pk.key = '%s' AND npb.value = :%s)"
+                                    "WHERE npb.node_id = %s AND pk.key = '%s' AND npb.value = :%s)"
                                     ")",
-                                    alias, pair->key, param->name,
-                                    alias, pair->key, param->name,
-                                    alias, pair->key, param->name,
-                                    alias, pair->key, param->name);
+                                    node_id_ref, pair->key, param->name,
+                                    node_id_ref, pair->key, param->name,
+                                    node_id_ref, pair->key, param->name,
+                                    node_id_ref, pair->key, param->name);
 
                                 sql_where(ctx->unified_builder, dbuf_get(&cond));
                                 dbuf_free(&cond);
