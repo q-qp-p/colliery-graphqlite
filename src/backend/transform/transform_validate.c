@@ -320,6 +320,99 @@ static int validate_conversion_call(cypher_function_call *func, char **error_mes
     return 0;
 }
 
+/* Detect homogeneously-typed literal lists. Returns the literal type
+ * (LITERAL_STRING / LITERAL_BOOLEAN / LITERAL_INTEGER / LITERAL_DECIMAL)
+ * when every element is a literal of the same type. Returns -1 for
+ * heterogeneous, empty, or non-literal lists. (Used by quantifier
+ * type-mismatch validation: a homogeneously non-numeric list bound to
+ * the iteration variable lets us reject `x % 2` at compile time.) */
+static int list_homogeneous_literal_type(const ast_node *expr)
+{
+    if (!expr || expr->type != AST_NODE_LIST) return -1;
+    const cypher_list *lst = (const cypher_list *)expr;
+    if (!lst->items || lst->items->count == 0) return -1;
+    int common = -1;
+    for (int i = 0; i < lst->items->count; i++) {
+        ast_node *el = lst->items->items[i];
+        if (!el || el->type != AST_NODE_LITERAL) return -1;
+        const cypher_literal *lit = (const cypher_literal *)el;
+        if (lit->literal_type == LITERAL_NULL) continue;  /* nulls don't constrain */
+        if (common == -1) common = lit->literal_type;
+        else if (common != lit->literal_type) return -1;
+    }
+    return common;
+}
+
+/* Walk `expr` looking for uses of `var_name` inside arithmetic
+ * operations (MOD, ADD-other-than-string, SUB, MUL, DIV, POW) that
+ * require numeric operands. If found with a known non-numeric var
+ * type, raise InvalidArgumentType. */
+static int check_numeric_var_misuse(const ast_node *expr,
+                                    const char *var_name,
+                                    int var_literal_type,
+                                    char **error_message)
+{
+    if (!expr) return 0;
+    if (expr->type == AST_NODE_BINARY_OP) {
+        const cypher_binary_op *b = (const cypher_binary_op *)expr;
+        bool is_numeric_op = (b->op_type == BINARY_OP_MOD ||
+                              b->op_type == BINARY_OP_SUB ||
+                              b->op_type == BINARY_OP_MUL ||
+                              b->op_type == BINARY_OP_DIV ||
+                              b->op_type == BINARY_OP_POW);
+        if (is_numeric_op) {
+            /* Check if either side is the iteration variable. */
+            for (int side = 0; side < 2; side++) {
+                ast_node *op = (side == 0) ? b->left : b->right;
+                if (op && op->type == AST_NODE_IDENTIFIER &&
+                    strcmp(((cypher_identifier*)op)->name, var_name) == 0) {
+                    const char *tname = "Unknown";
+                    if (var_literal_type == LITERAL_STRING)  tname = "String";
+                    else if (var_literal_type == LITERAL_BOOLEAN) tname = "Boolean";
+                    set_error(error_message,
+                        "SyntaxError: InvalidArgumentType: arithmetic on `%s` "
+                        "of type %s is not supported (numeric operand required)",
+                        var_name, tname);
+                    return -1;
+                }
+            }
+        }
+        if (check_numeric_var_misuse(b->left, var_name, var_literal_type, error_message) < 0) return -1;
+        return check_numeric_var_misuse(b->right, var_name, var_literal_type, error_message);
+    }
+    if (expr->type == AST_NODE_NOT_EXPR) {
+        return check_numeric_var_misuse(((const cypher_not_expr*)expr)->expr,
+                                        var_name, var_literal_type, error_message);
+    }
+    if (expr->type == AST_NODE_FUNCTION_CALL) {
+        const cypher_function_call *f = (const cypher_function_call *)expr;
+        if (f->args) {
+            for (int i = 0; i < f->args->count; i++) {
+                if (check_numeric_var_misuse(f->args->items[i], var_name,
+                                              var_literal_type, error_message) < 0) return -1;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* Validate a list predicate (all/any/none/single): if the list is a
+ * homogeneously non-numeric literal list, the iteration variable's
+ * type is known, and arithmetic ops on it in the predicate are
+ * InvalidArgumentType. (Quantifier1/2/3/4 [15] family.) */
+static int validate_list_predicate_types(const cypher_list_predicate *lp,
+                                         char **error_message)
+{
+    if (!lp || !lp->variable || !lp->predicate) return 0;
+    int t = list_homogeneous_literal_type(lp->list_expr);
+    if (t == LITERAL_STRING || t == LITERAL_BOOLEAN) {
+        if (check_numeric_var_misuse(lp->predicate, lp->variable, t, error_message) < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int validate_expr(ast_node *expr, char **error_message)
 {
     if (!expr) return 0;
@@ -348,6 +441,13 @@ static int validate_expr(ast_node *expr, char **error_message)
                         return -1;
                 }
             }
+            return 0;
+        }
+        case AST_NODE_LIST_PREDICATE: {
+            cypher_list_predicate *lp = (cypher_list_predicate *)expr;
+            if (validate_list_predicate_types(lp, error_message) < 0) return -1;
+            if (validate_expr(lp->list_expr, error_message) < 0) return -1;
+            if (validate_expr(lp->predicate, error_message) < 0) return -1;
             return 0;
         }
         case AST_NODE_NULL_CHECK: {
