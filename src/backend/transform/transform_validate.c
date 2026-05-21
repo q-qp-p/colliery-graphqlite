@@ -591,6 +591,53 @@ static const char *kAggregateNames[] = {
     "stdev", "stdevp", "percentilecont", "percentiledisc",
     NULL
 };
+/* Non-deterministic functions whose use inside an aggregate makes the
+ * aggregate's result undefined per the openCypher spec. count(rand())
+ * / sum(timestamp()) / etc. raise NonConstantExpression at compile
+ * time (Return6 [15]). */
+static const char *kNonDeterministicFuncs[] = {
+    "rand", "random",
+    NULL
+};
+static bool ast_func_name_in(const ast_node *expr, const char **names) {
+    if (!expr || expr->type != AST_NODE_FUNCTION_CALL) return false;
+    const cypher_function_call *fc = (const cypher_function_call *)expr;
+    if (!fc->function_name) return false;
+    for (int i = 0; names[i]; i++) {
+        if (strcasecmp(fc->function_name, names[i]) == 0) return true;
+    }
+    return false;
+}
+static bool ast_contains_nondeterministic(const ast_node *expr) {
+    if (!expr) return false;
+    if (ast_func_name_in(expr, kNonDeterministicFuncs)) return true;
+    switch (expr->type) {
+        case AST_NODE_BINARY_OP: {
+            const cypher_binary_op *b = (const cypher_binary_op *)expr;
+            return ast_contains_nondeterministic(b->left) ||
+                   ast_contains_nondeterministic(b->right);
+        }
+        case AST_NODE_NOT_EXPR:
+            return ast_contains_nondeterministic(((const cypher_not_expr *)expr)->expr);
+        case AST_NODE_FUNCTION_CALL: {
+            const cypher_function_call *f = (const cypher_function_call *)expr;
+            if (f->args) {
+                for (int i = 0; i < f->args->count; i++) {
+                    if (ast_contains_nondeterministic(f->args->items[i])) return true;
+                }
+            }
+            return false;
+        }
+        case AST_NODE_PROPERTY:
+            return ast_contains_nondeterministic(((const cypher_property *)expr)->expr);
+        case AST_NODE_SUBSCRIPT: {
+            const cypher_subscript *s = (const cypher_subscript *)expr;
+            return ast_contains_nondeterministic(s->expr) ||
+                   ast_contains_nondeterministic(s->index);
+        }
+        default: return false;
+    }
+}
 static bool ast_is_aggregate_func(const ast_node *expr) {
     if (!expr || expr->type != AST_NODE_FUNCTION_CALL) return false;
     const cypher_function_call *fc = (const cypher_function_call *)expr;
@@ -699,6 +746,57 @@ static void collect_grouping_keys(ast_list *items, name_set *out) {
         if (it->alias) nset_add(out, it->alias);
     }
 }
+/* NonConstantExpression: aggregate functions whose argument contains a
+ * non-deterministic call (rand/random/timestamp). Walk the expression
+ * tree and check each aggregate's arguments. Return6 [15]. */
+static int check_nonconstant_in_aggregate(const ast_node *expr,
+                                          char **error_message)
+{
+    if (!expr) return 0;
+    if (ast_is_aggregate_func(expr)) {
+        const cypher_function_call *f = (const cypher_function_call *)expr;
+        if (f->args) {
+            for (int i = 0; i < f->args->count; i++) {
+                if (ast_contains_nondeterministic(f->args->items[i])) {
+                    set_error(error_message,
+                              "SyntaxError: NonConstantExpression: "
+                              "aggregate function `%s` does not accept a non-deterministic "
+                              "expression (rand/random/etc.) as an argument",
+                              f->function_name);
+                    return -1;
+                }
+            }
+        }
+    }
+    /* Recurse into sub-expressions. */
+    switch (expr->type) {
+        case AST_NODE_BINARY_OP: {
+            const cypher_binary_op *b = (const cypher_binary_op *)expr;
+            if (check_nonconstant_in_aggregate(b->left, error_message) < 0) return -1;
+            return check_nonconstant_in_aggregate(b->right, error_message);
+        }
+        case AST_NODE_NOT_EXPR:
+            return check_nonconstant_in_aggregate(((const cypher_not_expr *)expr)->expr, error_message);
+        case AST_NODE_FUNCTION_CALL: {
+            const cypher_function_call *f = (const cypher_function_call *)expr;
+            if (f->args) {
+                for (int i = 0; i < f->args->count; i++) {
+                    if (check_nonconstant_in_aggregate(f->args->items[i], error_message) < 0) return -1;
+                }
+            }
+            return 0;
+        }
+        case AST_NODE_PROPERTY:
+            return check_nonconstant_in_aggregate(((const cypher_property *)expr)->expr, error_message);
+        case AST_NODE_SUBSCRIPT: {
+            const cypher_subscript *s = (const cypher_subscript *)expr;
+            if (check_nonconstant_in_aggregate(s->expr, error_message) < 0) return -1;
+            return check_nonconstant_in_aggregate(s->index, error_message);
+        }
+        default: return 0;
+    }
+}
+
 /* AmbiguousAggregationExpression: an expression that mixes an aggregate
  * call with free variable references that aren't grouping keys. */
 static int check_ambiguous_aggregation(const ast_node *expr,
@@ -776,6 +874,9 @@ static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
                 if (check_ambiguous_aggregation(item->expr, &grouping_keys, error_message) < 0) {
                     nset_free(&seen); nset_free(&grouping_keys); return -1;
                 }
+                if (check_nonconstant_in_aggregate(item->expr, error_message) < 0) {
+                    nset_free(&seen); nset_free(&grouping_keys); return -1;
+                }
             }
         }
         nset_free(&seen);
@@ -835,6 +936,9 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
             if (validate_expr(item->expr, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
             if (validate_expr_typed(item->expr, vctx_out, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
             if (check_ambiguous_aggregation(item->expr, &grouping_keys, error_message) < 0) {
+                nset_free(&seen); nset_free(&grouping_keys); return -1;
+            }
+            if (check_nonconstant_in_aggregate(item->expr, error_message) < 0) {
                 nset_free(&seen); nset_free(&grouping_keys); return -1;
             }
             /* Track the alias's bound type for downstream clauses. */
