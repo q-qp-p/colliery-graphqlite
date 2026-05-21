@@ -690,10 +690,40 @@ static int transform_union_sql(cypher_transform_context *ctx, cypher_union *unio
      * Reset state for right side of UNION:
      * - Create fresh unified_builder so second query starts fresh
      * - Reset variable context so variables don't leak between branches
+     *
+     * Preserve the left branch's CTE buffers (cte and pre_cte) across
+     * the reset — both branches share the same WITH clause in the
+     * assembled SQL, and freeing the builder would lose branch-1's
+     * CTE definitions. Without this, UNION-of-UNWINDs fails with
+     * "no such table: _unwind_0" because the second branch's
+     * prepend_cte_to_sql only sees its own CTEs.
      */
+    char *saved_cte = NULL, *saved_pre_cte = NULL;
+    int saved_cte_count = 0, saved_pre_count = 0;
+    bool saved_pre_recursive = false;
     if (ctx->unified_builder) {
+        if (!dbuf_is_empty(&ctx->unified_builder->cte)) {
+            saved_cte = strdup(dbuf_get(&ctx->unified_builder->cte));
+            saved_cte_count = ctx->unified_builder->cte_count;
+        }
+        if (!dbuf_is_empty(&ctx->unified_builder->pre_cte)) {
+            saved_pre_cte = strdup(dbuf_get(&ctx->unified_builder->pre_cte));
+            saved_pre_count = ctx->unified_builder->pre_cte_count;
+            saved_pre_recursive = ctx->unified_builder->pre_cte_recursive;
+        }
         sql_builder_free(ctx->unified_builder);
         ctx->unified_builder = sql_builder_create();
+        if (saved_cte) {
+            dbuf_append(&ctx->unified_builder->cte, saved_cte);
+            ctx->unified_builder->cte_count = saved_cte_count;
+            free(saved_cte);
+        }
+        if (saved_pre_cte) {
+            dbuf_append(&ctx->unified_builder->pre_cte, saved_pre_cte);
+            ctx->unified_builder->pre_cte_count = saved_pre_count;
+            ctx->unified_builder->pre_cte_recursive = saved_pre_recursive;
+            free(saved_pre_cte);
+        }
     }
     transform_var_ctx_reset(ctx->var_ctx);
 
