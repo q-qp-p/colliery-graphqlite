@@ -573,6 +573,162 @@ static void nset_add(name_set *s, const char *name) {
     s->names[s->count++] = name;
 }
 
+/* Aggregate-ambiguity helpers (Return6 [20], With6 [8] et al).
+ *
+ * Cypher requires that when a RETURN / WITH item contains an aggregate
+ * function inside a larger expression, every non-aggregate part must be
+ * a grouping key — i.e. the expression must consist purely of aggregates
+ * and references to variables that appear as bare items elsewhere in the
+ * projection. Mixing `me.age + count(you.age)` is ambiguous.
+ *
+ * The check below is conservative: if an expression has an aggregate
+ * function somewhere AND there's a free identifier (or property access)
+ * reference outside any aggregate call AND that reference isn't itself
+ * the top-level expression, flag AmbiguousAggregationExpression.
+ */
+static const char *kAggregateNames[] = {
+    "count", "sum", "avg", "min", "max", "collect",
+    "stdev", "stdevp", "percentilecont", "percentiledisc",
+    NULL
+};
+static bool ast_is_aggregate_func(const ast_node *expr) {
+    if (!expr || expr->type != AST_NODE_FUNCTION_CALL) return false;
+    const cypher_function_call *fc = (const cypher_function_call *)expr;
+    if (!fc->function_name) return false;
+    for (int i = 0; kAggregateNames[i]; i++) {
+        if (strcasecmp(fc->function_name, kAggregateNames[i]) == 0) return true;
+    }
+    return false;
+}
+static bool ast_contains_aggregate(const ast_node *expr) {
+    if (!expr) return false;
+    if (ast_is_aggregate_func(expr)) return true;
+    switch (expr->type) {
+        case AST_NODE_BINARY_OP: {
+            const cypher_binary_op *b = (const cypher_binary_op *)expr;
+            return ast_contains_aggregate(b->left) || ast_contains_aggregate(b->right);
+        }
+        case AST_NODE_NOT_EXPR:
+            return ast_contains_aggregate(((const cypher_not_expr *)expr)->expr);
+        case AST_NODE_FUNCTION_CALL: {
+            const cypher_function_call *f = (const cypher_function_call *)expr;
+            if (f->args) {
+                for (int i = 0; i < f->args->count; i++) {
+                    if (ast_contains_aggregate(f->args->items[i])) return true;
+                }
+            }
+            return false;
+        }
+        case AST_NODE_PROPERTY:
+            return ast_contains_aggregate(((const cypher_property *)expr)->expr);
+        case AST_NODE_SUBSCRIPT: {
+            const cypher_subscript *s = (const cypher_subscript *)expr;
+            return ast_contains_aggregate(s->expr) || ast_contains_aggregate(s->index);
+        }
+        default:
+            return false;
+    }
+}
+/* Walk `expr` and gather identifier names referenced OUTSIDE of any
+ * aggregate call. Properties contribute their base identifier name. */
+static void collect_free_var_names(const ast_node *expr, name_set *out) {
+    if (!expr) return;
+    if (ast_is_aggregate_func(expr)) return;  /* inside-agg is fine */
+    if (expr->type == AST_NODE_IDENTIFIER) {
+        nset_add(out, ((const cypher_identifier *)expr)->name);
+        return;
+    }
+    if (expr->type == AST_NODE_PROPERTY) {
+        const cypher_property *p = (const cypher_property *)expr;
+        if (p->expr && p->expr->type == AST_NODE_IDENTIFIER) {
+            nset_add(out, ((const cypher_identifier *)p->expr)->name);
+        } else if (p->expr) {
+            collect_free_var_names(p->expr, out);
+        }
+        return;
+    }
+    switch (expr->type) {
+        case AST_NODE_BINARY_OP: {
+            const cypher_binary_op *b = (const cypher_binary_op *)expr;
+            collect_free_var_names(b->left, out);
+            collect_free_var_names(b->right, out);
+            return;
+        }
+        case AST_NODE_NOT_EXPR:
+            collect_free_var_names(((const cypher_not_expr *)expr)->expr, out);
+            return;
+        case AST_NODE_FUNCTION_CALL: {
+            const cypher_function_call *f = (const cypher_function_call *)expr;
+            if (f->args) {
+                for (int i = 0; i < f->args->count; i++) {
+                    collect_free_var_names(f->args->items[i], out);
+                }
+            }
+            return;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            const cypher_subscript *s = (const cypher_subscript *)expr;
+            collect_free_var_names(s->expr, out);
+            collect_free_var_names(s->index, out);
+            return;
+        }
+        default: return;
+    }
+}
+/* Gather names introduced as "grouping keys" by a list of return/with
+ * items: a bare identifier item like `RETURN me` or `me AS m`, OR
+ * a bare property item like `RETURN me.age` / `me.age AS age`. The
+ * alias (if present) and the base identifier both count. */
+static void collect_grouping_keys(ast_list *items, name_set *out) {
+    if (!items) return;
+    for (int i = 0; i < items->count; i++) {
+        cypher_return_item *it = (cypher_return_item *)items->items[i];
+        if (!it || !it->expr) continue;
+        /* Skip items that ARE aggregates — they aren't grouping keys. */
+        if (ast_is_aggregate_func(it->expr)) continue;
+        if (ast_contains_aggregate(it->expr)) continue;
+        /* Bare identifier or property access -> contributes a grouping key. */
+        if (it->expr->type == AST_NODE_IDENTIFIER) {
+            nset_add(out, ((cypher_identifier *)it->expr)->name);
+        } else if (it->expr->type == AST_NODE_PROPERTY) {
+            const cypher_property *p = (const cypher_property *)it->expr;
+            if (p->expr && p->expr->type == AST_NODE_IDENTIFIER) {
+                nset_add(out, ((cypher_identifier *)p->expr)->name);
+            }
+        }
+        if (it->alias) nset_add(out, it->alias);
+    }
+}
+/* AmbiguousAggregationExpression: an expression that mixes an aggregate
+ * call with free variable references that aren't grouping keys. */
+static int check_ambiguous_aggregation(const ast_node *expr,
+                                       const name_set *grouping_keys,
+                                       char **error_message)
+{
+    if (!expr) return 0;
+    /* Nothing to check if the expression itself is bare or a top-level aggregate. */
+    if (ast_is_aggregate_func(expr)) return 0;
+    if (expr->type == AST_NODE_IDENTIFIER) return 0;
+    if (expr->type == AST_NODE_PROPERTY) return 0;
+    if (!ast_contains_aggregate(expr)) return 0;
+    /* Has an aggregate inside a larger expression. Gather free var refs
+     * and check that all of them are grouping keys. */
+    name_set free_vars; nset_init(&free_vars);
+    collect_free_var_names(expr, &free_vars);
+    for (int i = 0; i < free_vars.count; i++) {
+        if (!nset_contains(grouping_keys, free_vars.names[i])) {
+            set_error(error_message,
+                      "SyntaxError: AmbiguousAggregationExpression: "
+                      "`%s` is not a grouping key but is used outside an aggregate function",
+                      free_vars.names[i]);
+            nset_free(&free_vars);
+            return -1;
+        }
+    }
+    nset_free(&free_vars);
+    return 0;
+}
+
 /* Walk a clause's expressions with the given var-type context, also
  * picking up new var bindings from WITH items along the way. */
 static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
@@ -580,6 +736,9 @@ static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
 {
     if (!ret) return 0;
     if (ret->items) {
+        /* Collect grouping keys for ambiguous-aggregation detection. */
+        name_set grouping_keys; nset_init(&grouping_keys);
+        collect_grouping_keys(ret->items, &grouping_keys);
         /* Duplicate explicit aliases in RETURN are a ColumnNameConflict. */
         name_set seen; nset_init(&seen);
         for (int i = 0; i < ret->items->count; i++) {
@@ -597,6 +756,7 @@ static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
                 set_error(error_message,
                           "SyntaxError: UnexpectedSyntax: a path pattern is not a valid expression in RETURN");
                 nset_free(&seen);
+                nset_free(&grouping_keys);
                 return -1;
             }
             if (item->alias) {
@@ -605,16 +765,21 @@ static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
                               "SyntaxError: ColumnNameConflict: Multiple result columns with the same name `%s`",
                               item->alias);
                     nset_free(&seen);
+                    nset_free(&grouping_keys);
                     return -1;
                 }
                 nset_add(&seen, item->alias);
             }
             if (item->expr) {
-                if (validate_expr(item->expr, error_message) < 0) { nset_free(&seen); return -1; }
-                if (validate_expr_typed(item->expr, vctx, error_message) < 0) { nset_free(&seen); return -1; }
+                if (validate_expr(item->expr, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
+                if (validate_expr_typed(item->expr, vctx, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
+                if (check_ambiguous_aggregation(item->expr, &grouping_keys, error_message) < 0) {
+                    nset_free(&seen); nset_free(&grouping_keys); return -1;
+                }
             }
         }
         nset_free(&seen);
+        nset_free(&grouping_keys);
     }
     if (validate_skip_limit(ret->skip, "SKIP", error_message) < 0) return -1;
     if (validate_skip_limit(ret->limit, "LIMIT", error_message) < 0) return -1;
@@ -626,6 +791,9 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
 {
     if (!with) return 0;
     if (with->items) {
+        /* Collect grouping keys for ambiguous-aggregation detection. */
+        name_set grouping_keys; nset_init(&grouping_keys);
+        collect_grouping_keys(with->items, &grouping_keys);
         /* Duplicate aliases in WITH are a ColumnNameConflict. */
         name_set seen; nset_init(&seen);
         for (int i = 0; i < with->items->count; i++) {
@@ -640,6 +808,7 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
                 set_error(error_message,
                           "SyntaxError: UnexpectedSyntax: a path pattern is not a valid expression in WITH");
                 nset_free(&seen);
+                nset_free(&grouping_keys);
                 return -1;
             }
             /* Every non-identifier expression in WITH must be aliased.
@@ -649,6 +818,7 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
                 set_error(error_message,
                           "SyntaxError: NoExpressionAlias: every WITH item that is not a bare variable must be aliased");
                 nset_free(&seen);
+                nset_free(&grouping_keys);
                 return -1;
             }
             if (item->alias) {
@@ -657,12 +827,16 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
                               "SyntaxError: ColumnNameConflict: Multiple result columns with the same name `%s`",
                               item->alias);
                     nset_free(&seen);
+                    nset_free(&grouping_keys);
                     return -1;
                 }
                 nset_add(&seen, item->alias);
             }
-            if (validate_expr(item->expr, error_message) < 0) { nset_free(&seen); return -1; }
-            if (validate_expr_typed(item->expr, vctx_out, error_message) < 0) { nset_free(&seen); return -1; }
+            if (validate_expr(item->expr, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
+            if (validate_expr_typed(item->expr, vctx_out, error_message) < 0) { nset_free(&seen); nset_free(&grouping_keys); return -1; }
+            if (check_ambiguous_aggregation(item->expr, &grouping_keys, error_message) < 0) {
+                nset_free(&seen); nset_free(&grouping_keys); return -1;
+            }
             /* Track the alias's bound type for downstream clauses. */
             if (item->alias) {
                 vctx_register(vctx_out, item->alias,
@@ -670,6 +844,7 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
             }
         }
         nset_free(&seen);
+        nset_free(&grouping_keys);
     }
     if (with->where) {
         if (validate_expr(with->where, error_message) < 0) return -1;
