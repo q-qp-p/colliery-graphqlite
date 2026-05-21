@@ -11,7 +11,7 @@ archived: false
 
 tags:
   - "#task"
-  - "#phase/backlog"
+  - "#phase/completed"
   - "#bug"
 
 
@@ -59,9 +59,23 @@ way (rebinding semantics are mostly null/empty paths).
 
 ## Acceptance Criteria
 
-- [ ] Reproducer returns 0 rows (label predicate enforced)
-- [ ] No regression on existing WITH-rebinding scenarios
-- [ ] Match3 [25] flips from fail → pass
+- [x] Reproducer returns 0 rows (label predicate enforced)
+- [x] No regression on existing WITH-rebinding scenarios (944/944 unit)
+- [x] Match3 [25] flips from fail → pass (TCK 3422 → 3423)
+
+## Status Updates
+
+**2026-05-21** — Completed in commit 8f63888.
+
+Added label-predicate emission to the `is_from_with` branch in
+transform_match.c. For each label on the re-bound node pattern, emit
+`EXISTS (SELECT 1 FROM node_labels WHERE node_id = <alias> AND label = '<label>')`
+into the WHERE clause. The alias is the existing column reference
+(e.g. `_with_0.a1`) which holds the node id.
+
+Open follow-on: property-predicate rebinding (`(a1 {prop: x})` after
+WITH a1) likely has the same drop pattern; not addressed in this
+commit.
 
 ## Discovered
 
