@@ -827,6 +827,148 @@ static int check_ambiguous_aggregation(const ast_node *expr,
     return 0;
 }
 
+/* Recursive walker for ORDER BY: accept if every non-aggregate free
+ * reference is in `available` or, in property-path form,
+ * `available_props`. Skips inside aggregate calls. */
+static int order_by_walk_check(const ast_node *expr,
+                               const name_set *available,
+                               const name_set *available_props,
+                               char **error_message)
+{
+    if (!expr) return 0;
+    if (ast_is_aggregate_func(expr)) return 0;  /* inside-agg is fine */
+    if (expr->type == AST_NODE_IDENTIFIER) {
+        const char *n = ((const cypher_identifier *)expr)->name;
+        if (!nset_contains(available, n)) {
+            set_error(error_message,
+                      "SyntaxError: UndefinedVariable: `%s` is not defined in this scope "
+                      "(ORDER BY can only reference projected columns when DISTINCT or "
+                      "aggregation is used)", n);
+            return -1;
+        }
+        return 0;
+    }
+    if (expr->type == AST_NODE_PROPERTY) {
+        const cypher_property *p = (const cypher_property *)expr;
+        /* Accept full-path match. */
+        if (p->expr && p->expr->type == AST_NODE_IDENTIFIER && p->property_name) {
+            char path[256];
+            snprintf(path, sizeof(path), "%s.%s",
+                     ((const cypher_identifier *)p->expr)->name, p->property_name);
+            if (nset_contains(available_props, path)) return 0;
+        }
+        /* Otherwise recurse into the base. */
+        return order_by_walk_check(p->expr, available, available_props, error_message);
+    }
+    switch (expr->type) {
+        case AST_NODE_BINARY_OP: {
+            const cypher_binary_op *b = (const cypher_binary_op *)expr;
+            if (order_by_walk_check(b->left, available, available_props, error_message) < 0) return -1;
+            return order_by_walk_check(b->right, available, available_props, error_message);
+        }
+        case AST_NODE_NOT_EXPR:
+            return order_by_walk_check(((const cypher_not_expr *)expr)->expr, available, available_props, error_message);
+        case AST_NODE_FUNCTION_CALL: {
+            const cypher_function_call *f = (const cypher_function_call *)expr;
+            if (f->args) {
+                for (int i = 0; i < f->args->count; i++) {
+                    if (order_by_walk_check(f->args->items[i], available, available_props, error_message) < 0) return -1;
+                }
+            }
+            return 0;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            const cypher_subscript *s = (const cypher_subscript *)expr;
+            if (order_by_walk_check(s->expr, available, available_props, error_message) < 0) return -1;
+            return order_by_walk_check(s->index, available, available_props, error_message);
+        }
+        default:
+            return 0;
+    }
+}
+
+/* Validate ORDER BY items against a projection. With DISTINCT or any
+ * aggregation in the projection, ORDER BY can only reference projected
+ * columns (aliases or bare identifiers/properties projected). Free
+ * references to pre-projection variables become UndefinedVariable.
+ *
+ * Without DISTINCT or aggregation, pre-projection variables remain
+ * visible — bypass the check.
+ *
+ * Covers ReturnOrderBy2 [13], ReturnOrderBy6 [4]/[5], WithOrderBy4
+ * [13]/[14]/[19], etc.
+ */
+static int validate_order_by_with_projection(ast_list *order_by,
+                                              ast_list *projection,
+                                              bool distinct,
+                                              char **error_message)
+{
+    if (!order_by || !projection) return 0;
+    /* Are we in restricted mode? */
+    bool any_aggregate = false;
+    for (int i = 0; i < projection->count; i++) {
+        cypher_return_item *it = (cypher_return_item *)projection->items[i];
+        if (it && it->expr && ast_contains_aggregate(it->expr)) {
+            any_aggregate = true;
+            break;
+        }
+    }
+    if (!distinct && !any_aggregate) return 0;
+
+    /* Collect names available to ORDER BY in restricted mode:
+     *   - explicit aliases of any projection item
+     *   - bare identifiers (RETURN n -> "n" is available)
+     *
+     * Bare property projections (RETURN a.name) do NOT expose `a` as
+     * a whole — DISTINCT may collapse rows that share a.name but
+     * differ on other a properties, so a.age in ORDER BY is undefined.
+     * They DO expose the specific path: tracked separately in
+     * `available_props` as "base.prop" strings. */
+    name_set available; nset_init(&available);
+    name_set available_props; nset_init(&available_props);
+    /* Storage for synthesized "base.prop" strings — kept alive while
+     * we run the order-by walk, then freed below. */
+    char **prop_storage = NULL;
+    int prop_storage_count = 0;
+    int prop_storage_cap = 0;
+    for (int i = 0; i < projection->count; i++) {
+        cypher_return_item *it = (cypher_return_item *)projection->items[i];
+        if (!it || !it->expr) continue;
+        if (it->alias) nset_add(&available, it->alias);
+        if (it->expr->type == AST_NODE_IDENTIFIER) {
+            nset_add(&available, ((cypher_identifier *)it->expr)->name);
+        } else if (it->expr->type == AST_NODE_PROPERTY) {
+            const cypher_property *p = (const cypher_property *)it->expr;
+            if (p->expr && p->expr->type == AST_NODE_IDENTIFIER && p->property_name) {
+                const char *base = ((cypher_identifier *)p->expr)->name;
+                size_t len = strlen(base) + 1 + strlen(p->property_name) + 1;
+                char *s = malloc(len);
+                if (s) {
+                    snprintf(s, len, "%s.%s", base, p->property_name);
+                    if (prop_storage_count >= prop_storage_cap) {
+                        prop_storage_cap = prop_storage_cap ? prop_storage_cap * 2 : 8;
+                        prop_storage = realloc(prop_storage, prop_storage_cap * sizeof(char*));
+                    }
+                    prop_storage[prop_storage_count++] = s;
+                    nset_add(&available_props, s);
+                }
+            }
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < order_by->count && rc == 0; i++) {
+        cypher_order_by_item *obi = (cypher_order_by_item *)order_by->items[i];
+        if (!obi || !obi->expr) continue;
+        rc = order_by_walk_check(obi->expr, &available, &available_props, error_message);
+    }
+    nset_free(&available);
+    nset_free(&available_props);
+    for (int i = 0; i < prop_storage_count; i++) free(prop_storage[i]);
+    free(prop_storage);
+    return rc;
+}
+
 /* Walk a clause's expressions with the given var-type context, also
  * picking up new var bindings from WITH items along the way. */
 static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
@@ -882,6 +1024,7 @@ static int validate_return_clause(cypher_return *ret, const var_type_ctx *vctx,
         nset_free(&seen);
         nset_free(&grouping_keys);
     }
+    if (validate_order_by_with_projection(ret->order_by, ret->items, ret->distinct, error_message) < 0) return -1;
     if (validate_skip_limit(ret->skip, "SKIP", error_message) < 0) return -1;
     if (validate_skip_limit(ret->limit, "LIMIT", error_message) < 0) return -1;
     return 0;
@@ -954,6 +1097,7 @@ static int validate_with_clause(cypher_with *with, var_type_ctx *vctx_out,
         if (validate_expr(with->where, error_message) < 0) return -1;
         if (validate_expr_typed(with->where, vctx_out, error_message) < 0) return -1;
     }
+    if (validate_order_by_with_projection(with->order_by, with->items, with->distinct, error_message) < 0) return -1;
     if (validate_skip_limit(with->skip, "SKIP", error_message) < 0) return -1;
     if (validate_skip_limit(with->limit, "LIMIT", error_message) < 0) return -1;
     return 0;
