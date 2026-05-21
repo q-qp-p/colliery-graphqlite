@@ -287,14 +287,20 @@ int transform_binary_operation(cypher_transform_context *ctx, cypher_binary_op *
     }
 
     /* Handle STARTS WITH operator — case-sensitive prefix match.
-     * Spec returns NULL when either operand is not a string. Use the
-     * typeof() guard to gate the substr comparison; otherwise NULL. */
+     * Spec returns NULL when either operand is not a string. List/map
+     * operands look like 'text' via typeof() because they're stored as
+     * JSON — exclude values starting with '[' or '{' so
+     * `[] STARTS WITH []` is null, not a textual match. (String8 [8]) */
     if (binary_op->op_type == BINARY_OP_STARTS_WITH) {
         append_sql(ctx, "(CASE WHEN typeof(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
-        append_sql(ctx, ") = 'text' AND typeof(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->left) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') AND typeof(");
         if (transform_expression(ctx, binary_op->right) < 0) return -1;
-        append_sql(ctx, ") = 'text' THEN substr(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->right) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') THEN substr(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
         append_sql(ctx, ", 1, length(");
         if (transform_expression(ctx, binary_op->right) < 0) return -1;
@@ -306,13 +312,17 @@ int transform_binary_operation(cypher_transform_context *ctx, cypher_binary_op *
     }
 
     /* Handle ENDS WITH operator — case-sensitive suffix match.
-     * Same NULL-on-non-string semantics as STARTS WITH. */
+     * Same NULL-on-non-string semantics as STARTS WITH (String9 [8]). */
     if (binary_op->op_type == BINARY_OP_ENDS_WITH) {
         append_sql(ctx, "(CASE WHEN typeof(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
-        append_sql(ctx, ") = 'text' AND typeof(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->left) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') AND typeof(");
         if (transform_expression(ctx, binary_op->right) < 0) return -1;
-        append_sql(ctx, ") = 'text' THEN substr(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->right) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') THEN substr(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
         append_sql(ctx, ", length(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
@@ -325,13 +335,22 @@ int transform_binary_operation(cypher_transform_context *ctx, cypher_binary_op *
         return 0;
     }
 
-    /* Handle CONTAINS operator - case-sensitive substring match. */
+    /* Handle CONTAINS operator - case-sensitive substring match.
+     * openCypher: non-string operands (numbers, booleans, lists, maps,
+     * nulls) yield NULL. Lists/maps are represented as JSON text here,
+     * so the typeof='text' check alone wasn't enough — exclude values
+     * whose first character is '[' or '{' (json container shape) so
+     * `[] CONTAINS []` returns null, not true. (String10 [8] et al.) */
     if (binary_op->op_type == BINARY_OP_CONTAINS) {
         append_sql(ctx, "(CASE WHEN typeof(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
-        append_sql(ctx, ") = 'text' AND typeof(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->left) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') AND typeof(");
         if (transform_expression(ctx, binary_op->right) < 0) return -1;
-        append_sql(ctx, ") = 'text' THEN INSTR(");
+        append_sql(ctx, ") = 'text' AND substr(");
+        if (transform_expression(ctx, binary_op->right) < 0) return -1;
+        append_sql(ctx, ", 1, 1) NOT IN ('[', '{') THEN INSTR(");
         if (transform_expression(ctx, binary_op->left) < 0) return -1;
         append_sql(ctx, ", ");
         if (transform_expression(ctx, binary_op->right) < 0) return -1;
