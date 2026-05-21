@@ -1666,18 +1666,48 @@ static void gql_dyn_addsub_func(sqlite3_context *ctx, int argc, sqlite3_value **
             sqlite3 *db = sqlite3_context_db_handle(ctx);
             sqlite3_stmt *stmt = NULL;
             const char *sql;
+            /* Detect if the scalar side is itself a JSON container
+             * (list/map). json_insert defaults to quoting text values
+             * as strings, which corrupts `[1,2] + [3]` into
+             * `[1,2,"[3]"]`. Wrapping with `json(?)` embeds the value
+             * verbatim — but json() is malformed-JSON-strict on bare
+             * scalars, so only wrap when the value looks like a JSON
+             * container. T-0304 / I-0042-followup. */
+            bool l_is_json_container = l_text && (l_text[0] == '[' || l_text[0] == '{');
+            bool r_is_json_container = r_text && (r_text[0] == '[' || r_text[0] == '{');
             if (l_is_arr && r_is_arr) {
-                /* list + list: concat */
-                sql = "WITH a(v) AS (SELECT value FROM json_each(?1)) , "
-                      "     b(v) AS (SELECT value FROM json_each(?2)) "
-                      "SELECT json_group_array(v) FROM (SELECT v FROM a UNION ALL SELECT v FROM b)";
+                /* list + list: splice the two JSON arrays at the text
+                 * level. UNION ALL strips JSON subtype, which causes
+                 * json_group_array to re-quote nested arrays/maps as
+                 * strings. String-splicing preserves them.
+                 *   [1,2] + [[3,4]] → [1,2] minus trailing ']' (= "[1,2")
+                 *                     + "," + [[3,4]] minus leading '[' (= "[3,4]]")
+                 *                   → "[1,2,[3,4]]" */
+                sql = "SELECT CASE "
+                      "  WHEN ?1 = '[]' THEN ?2 "
+                      "  WHEN ?2 = '[]' THEN ?1 "
+                      "  ELSE substr(?1, 1, length(?1)-1) || ',' || substr(?2, 2) "
+                      "END";
             } else if (l_is_arr) {
-                /* list + value: append */
-                sql = "SELECT json_insert(?1, '$[#]', ?2)";
+                /* list + value: append. Embed the value verbatim when
+                 * it's a JSON container (map literal, nested list).
+                 * Otherwise json_insert string-quotes it. */
+                sql = r_is_json_container
+                    ? "SELECT json_insert(?1, '$[#]', json(?2))"
+                    : "SELECT json_insert(?1, '$[#]', ?2)";
             } else {
-                /* value + list: prepend (Cypher allows this) */
-                sql = "WITH b(v) AS (SELECT value FROM json_each(?2)) "
-                      "SELECT json_group_array(v) FROM (SELECT ?1 AS v UNION ALL SELECT v FROM b)";
+                /* value + list: prepend (Cypher allows this). Splice
+                 * via substr to preserve the leading scalar's JSON
+                 * subtype when it's a container. */
+                if (l_is_json_container) {
+                    sql = "SELECT CASE "
+                          "  WHEN ?2 = '[]' THEN '[' || ?1 || ']' "
+                          "  ELSE '[' || ?1 || ',' || substr(?2, 2) "
+                          "END";
+                } else {
+                    sql = "WITH b(v) AS (SELECT value FROM json_each(?2)) "
+                          "SELECT json_group_array(v) FROM (SELECT ?1 AS v UNION ALL SELECT v FROM b)";
+                }
             }
             if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_value(stmt, 1, argv[0]);
