@@ -1721,15 +1721,15 @@ static int validate_write_rel_patterns(ast_list *patterns, const char *kw,
                           kw);
                 return -1;
             }
-            /* CREATE/MERGE requires exactly one direction (left XOR right).
-             * Undirected `()-[:T]-()` and bidirectional `()<-[:T]->()`
-             * both error per openCypher. (MERGE-undirected is technically
-             * legal per Cypher 9 spec — matches any direction, defaults
-             * to outgoing on create — but the executor doesn't yet
-             * implement that semantic correctly, and tests that *would*
-             * exercise it currently regress more than the syntax check
-             * helps. Re-enable per-kw once executor supports it.) */
-            if (rp->left_arrow == rp->right_arrow) {
+            /* CREATE requires a single explicit direction.
+             * MERGE allows undirected `()-[:T]-()` per Cypher 9 spec —
+             * match in either direction, default to outgoing if a new
+             * rel must be created. Bidirectional `()<-[:T]->()` is
+             * still rejected for both. */
+            bool undirected = (!rp->left_arrow && !rp->right_arrow);
+            bool bidirectional = (rp->left_arrow && rp->right_arrow);
+            if (bidirectional ||
+                (undirected && strcasecmp(kw, "CREATE") == 0)) {
                 set_error(error_message,
                           "SyntaxError: RequiresDirectedRelationship: %s requires a directed relationship",
                           kw);
