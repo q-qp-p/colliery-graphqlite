@@ -1357,6 +1357,19 @@ static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel
             if (from_str_pre && strstr(from_str_pre, target_alias)) target_already_added = true;
             if (!target_already_added && joins_str_pre && strstr(joins_str_pre, target_alias))
                 target_already_added = true;
+            /* T-0306: when the target's alias is a cross-clause column ref
+             * (e.g. "_with_0.a" from a prior WITH projection), the substring
+             * search above misses it because FROM/JOIN holds only the CTE
+             * name ("_with_0"). Detect WITH-bound variables (VAR_KIND_PROJECTED
+             * or alias_is_id) and treat the target as already-attached so we
+             * don't emit `LEFT JOIN nodes AS _with_0.a ON _with_0.a.id = ...`. */
+            if (!target_already_added && target_node->variable) {
+                transform_var *tv = transform_var_lookup(ctx->var_ctx, target_node->variable);
+                if (tv && (tv->kind == VAR_KIND_PROJECTED ||
+                           transform_var_alias_is_id(ctx->var_ctx, target_node->variable))) {
+                    target_already_added = true;
+                }
+            }
 
             /* Build the edge JOIN condition */
             dynamic_buffer edge_cond;
