@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import resource
+import signal
 import sqlite3
 import sys
 import traceback
@@ -31,7 +33,36 @@ from pathlib import Path
 DEFAULT_EXT = Path("build/graphqlite")
 
 
+def _suppress_crash_reporter() -> None:
+    """Stop the OS crash reporter from spawning a dialog for every
+    extension SIGABRT/SIGSEGV. The harness already catches the worker
+    death and records it as `ExtensionCrash`; the kernel-level crash
+    log is just noise (and on macOS it pops a 'graphqlite crashed'
+    notification per scenario, which makes iterative testing painful).
+
+    Two layers of defense:
+    1. Disable core dumps via RLIMIT_CORE — keeps disk + Crash Reporter
+       cycles down.
+    2. Re-raise SIGABRT as exit(134) via a signal handler — when the
+       extension calls abort(), Python catches the signal first and
+       exits cleanly with the conventional 128+SIGABRT code. macOS
+       won't dispatch the abort to Crash Reporter because we already
+       exited."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
+    def _die(signum, _frame):
+        os._exit(128 + signum)
+    for sig in (signal.SIGABRT, signal.SIGSEGV, signal.SIGBUS, signal.SIGFPE, signal.SIGILL):
+        try:
+            signal.signal(sig, _die)
+        except (ValueError, OSError):
+            pass
+
+
 def main() -> int:
+    _suppress_crash_reporter()
     ext_path = Path(os.environ.get("GQLITE_TCK_EXT", str(DEFAULT_EXT)))
     debug_log = os.environ.get("GQLITE_TCK_DEBUG_LOG")
 

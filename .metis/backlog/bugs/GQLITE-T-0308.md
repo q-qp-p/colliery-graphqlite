@@ -42,6 +42,38 @@ relies on SQLite's native operators which silently coerce types.
 - Comparison4 [1] (chained comparisons over null-yielding operands)
 - Likely others in Aggregation / Comparison families
 
+## Iter 23 update — capture-string approach ALSO crashes
+
+Tried the capture-expr approach proposed in this doc (call
+transform_expression only TWICE — once per operand — and substitute
+captured strings into a printf template). Built and ran the TCK:
+**still crashed in WITH WHERE execution with SIGABRT** at exactly the
+same site.
+
+This rules out "multiple invocations of transform_expression have
+side effects" as the cause. Even invoking it just once per operand
+in a fresh temp buffer triggers the crash on property access through
+the order-cmp path.
+
+Hypotheses to investigate:
+1. `transform_property_access` writes to `ctx->pending_prop_joins`
+   or `ctx->unified_builder->joins` — those buffers DO mutate ctx
+   even when we switch ctx->sql_buffer. So the FIRST capture writes
+   joins into the real builder, the SECOND capture writes the SAME
+   joins again — leading to duplicate aliases or buffer overflow.
+2. `transform_expression` may also mutate `ctx->global_alias_counter`
+   — calling twice gives two different aliases for the same property.
+3. The realloc-and-free dance for the temp buffer may leak/corrupt
+   memory if `transform_expression` realloc's the buffer and we then
+   free the original pointer (not the new one).
+
+Next attempt should:
+- Snapshot ALL ctx state (sql_buffer, pending_prop_joins,
+  unified_builder buffers, alias_counter) before each capture.
+- Restore everything after the capture.
+- Or: do ONE pass that emits operand-once, and use SQLite's CASE/WITH
+  to bind it to a name for re-use.
+
 ## Attempted fix and failure mode (iter 22)
 
 Tried wrapping LT/GT/LTE/GTE in `transform_expr_ops.c` with:
