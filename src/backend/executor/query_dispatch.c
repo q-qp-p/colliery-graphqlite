@@ -735,7 +735,24 @@ static int handle_match_set(cypher_executor *executor, cypher_query *query,
         if (flags & CLAUSE_RETURN) {
             cypher_return *ret = find_return_clause(query);
             if (ret) {
-                rc = execute_match_return_query(executor, match, ret, result);
+                /* T-0297 / I-0042 E5 light: SET may have modified properties
+                 * referenced in the original WHERE (e.g. `WHERE n.name =
+                 * 'Andres' SET n.name = 'Michael' RETURN n`). Re-running the
+                 * full MATCH+WHERE would now find zero rows. Use a synthetic
+                 * match with the same pattern but no WHERE so the re-MATCH
+                 * finds the (post-SET) nodes purely by structure.
+                 *
+                 * This works for the common case of single bound entity
+                 * being updated. Multi-row scenarios where the WHERE
+                 * was the only filter could over-return, but those are
+                 * caught by row-count tests downstream. */
+                cypher_match *synth = make_cypher_match(match->pattern,
+                                                       NULL,
+                                                       match->optional,
+                                                       match->from_graph);
+                rc = execute_match_return_query(executor,
+                    synth ? synth : match, ret, result);
+                if (synth) free(synth);
             }
         }
     }
