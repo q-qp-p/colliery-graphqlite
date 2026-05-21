@@ -643,7 +643,7 @@ cypher_query_result* cypher_transform_query(cypher_transform_context *ctx, cyphe
         result->error_message = strdup(sqlite3_errmsg(ctx->db));
         return result;
     }
-    
+
     return result;
     
 error:

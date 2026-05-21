@@ -666,9 +666,19 @@ char *sql_builder_to_string(sql_builder *b)
     }
 
     /* Raw-output appendage (I-0039 Extension A) — compound DML
-     * statements emitted by transform_set/delete/remove. */
+     * statements emitted by transform_set/delete/remove. Prefix with
+     * `; ` when both a SELECT body and raw DML are present so the two
+     * statements parse as separate sqlite3 statements (otherwise
+     * `... FROM tableINSERT INTO ...` is a syntax error). */
     if (!dbuf_is_empty(&b->raw_output)) {
-        dbuf_appendf(&result, "%s", dbuf_get(&b->raw_output));
+        const char *raw = dbuf_get(&b->raw_output);
+        /* Skip leading whitespace to test the first meaningful char. */
+        const char *p = raw;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!dbuf_is_empty(&result) && *p != ';') {
+            dbuf_append(&result, "; ");
+        }
+        dbuf_append(&result, raw);
     }
 
     b->finalized = true;
