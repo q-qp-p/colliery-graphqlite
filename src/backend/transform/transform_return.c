@@ -144,6 +144,76 @@ void add_pending_prop_join(cypher_transform_context *ctx, const char *join_sql)
  * Caller must free the returned string.
  * Returns NULL on error.
  */
+/* Recursively check if `expr` contains any aggregate function call.
+ * Cypher's "aggregate names" are count/sum/avg/min/max/collect/stdev/
+ * stdevp/percentilecont/percentiledisc. Used by the implicit-GROUP-BY
+ * detection — aggregates can be buried inside map/list/binary-op
+ * literals (e.g. `{kids: collect(x)}` is grouped on the surrounding
+ * projection key). Without this, MATCH-over-empty + such a projection
+ * returns one all-null row instead of zero rows. */
+static bool ast_contains_aggregate_func(ast_node *expr)
+{
+    if (!expr) return false;
+    switch (expr->type) {
+        case AST_NODE_FUNCTION_CALL: {
+            cypher_function_call *fc = (cypher_function_call *)expr;
+            if (fc->function_name) {
+                const char *n = fc->function_name;
+                if (!strcasecmp(n, "count") || !strcasecmp(n, "sum") ||
+                    !strcasecmp(n, "avg") || !strcasecmp(n, "min") ||
+                    !strcasecmp(n, "max") || !strcasecmp(n, "collect") ||
+                    !strcasecmp(n, "stdev") || !strcasecmp(n, "stdevp") ||
+                    !strcasecmp(n, "percentilecont") ||
+                    !strcasecmp(n, "percentiledisc"))
+                    return true;
+            }
+            if (fc->args) {
+                for (int i = 0; i < fc->args->count; i++) {
+                    if (ast_contains_aggregate_func(fc->args->items[i])) return true;
+                }
+            }
+            return false;
+        }
+        case AST_NODE_BINARY_OP: {
+            cypher_binary_op *b = (cypher_binary_op *)expr;
+            return ast_contains_aggregate_func(b->left) ||
+                   ast_contains_aggregate_func(b->right);
+        }
+        case AST_NODE_NOT_EXPR:
+            return ast_contains_aggregate_func(((cypher_not_expr *)expr)->expr);
+        case AST_NODE_LIST: {
+            cypher_list *lst = (cypher_list *)expr;
+            if (lst->items) {
+                for (int i = 0; i < lst->items->count; i++) {
+                    if (ast_contains_aggregate_func(lst->items->items[i])) return true;
+                }
+            }
+            return false;
+        }
+        case AST_NODE_MAP: {
+            cypher_map *m = (cypher_map *)expr;
+            if (m->pairs) {
+                for (int i = 0; i < m->pairs->count; i++) {
+                    cypher_map_pair *mp = (cypher_map_pair *)m->pairs->items[i];
+                    if (mp && ast_contains_aggregate_func(mp->value)) return true;
+                }
+            }
+            return false;
+        }
+        case AST_NODE_PROPERTY:
+            return ast_contains_aggregate_func(((cypher_property *)expr)->expr);
+        case AST_NODE_SUBSCRIPT: {
+            cypher_subscript *s = (cypher_subscript *)expr;
+            return ast_contains_aggregate_func(s->expr) ||
+                   ast_contains_aggregate_func(s->index);
+        }
+        case AST_NODE_NULL_CHECK:
+            return ast_contains_aggregate_func(((cypher_null_check *)expr)->expr);
+        default:
+            return false;
+    }
+}
+
 static char *transform_expression_to_string(cypher_transform_context *ctx, ast_node *expr)
 {
     if (!ctx || !expr) return NULL;
@@ -420,45 +490,26 @@ return_star_done:
          * become grouping keys (Cypher 9 spec). Detect by walking
          * items: count names like count/sum/avg/min/max/collect/
          * stdev/stdevp/percentilecont/percentiledisc as aggregating;
-         * emit GROUP BY for the non-aggregating ones. */
+         * emit GROUP BY for the non-aggregating ones.
+         *
+         * Aggregates may be nested inside map/list/binary-op
+         * expressions (e.g. `{kids: collect(x)}` or
+         * `collect(x) + [1]`). Recursive walker required so the
+         * grouped-empty case `MATCH ... RETURN n.name, {kids:
+         * collect(x)}` returns 0 rows on empty input instead of 1.
+         * (Return6 [6]/[18]/[19], With6 [6]/[7].) */
         if (ret->items && ret->items->count > 0) {
             bool has_agg = false;
             bool has_non_agg = false;
             for (int i = 0; i < ret->items->count; i++) {
                 cypher_return_item *it = (cypher_return_item *)ret->items->items[i];
-                bool is_agg = false;
-                if (it && it->expr && it->expr->type == AST_NODE_FUNCTION_CALL) {
-                    cypher_function_call *fc = (cypher_function_call *)it->expr;
-                    if (fc->function_name) {
-                        const char *n = fc->function_name;
-                        if (!strcasecmp(n, "count") || !strcasecmp(n, "sum") ||
-                            !strcasecmp(n, "avg") || !strcasecmp(n, "min") ||
-                            !strcasecmp(n, "max") || !strcasecmp(n, "collect") ||
-                            !strcasecmp(n, "stdev") || !strcasecmp(n, "stdevp") ||
-                            !strcasecmp(n, "percentilecont") ||
-                            !strcasecmp(n, "percentiledisc"))
-                            is_agg = true;
-                    }
-                }
+                bool is_agg = it && it->expr && ast_contains_aggregate_func(it->expr);
                 if (is_agg) has_agg = true; else has_non_agg = true;
             }
             if (has_agg && has_non_agg) {
                 for (int i = 0; i < ret->items->count; i++) {
                     cypher_return_item *it = (cypher_return_item *)ret->items->items[i];
-                    bool is_agg = false;
-                    if (it && it->expr && it->expr->type == AST_NODE_FUNCTION_CALL) {
-                        cypher_function_call *fc = (cypher_function_call *)it->expr;
-                        if (fc->function_name) {
-                            const char *n = fc->function_name;
-                            if (!strcasecmp(n, "count") || !strcasecmp(n, "sum") ||
-                                !strcasecmp(n, "avg") || !strcasecmp(n, "min") ||
-                                !strcasecmp(n, "max") || !strcasecmp(n, "collect") ||
-                                !strcasecmp(n, "stdev") || !strcasecmp(n, "stdevp") ||
-                                !strcasecmp(n, "percentilecont") ||
-                                !strcasecmp(n, "percentiledisc"))
-                                is_agg = true;
-                        }
-                    }
+                    bool is_agg = it && it->expr && ast_contains_aggregate_func(it->expr);
                     if (!is_agg) {
                         char *gb_expr = transform_expression_to_string(ctx, it->expr);
                         if (gb_expr) {
