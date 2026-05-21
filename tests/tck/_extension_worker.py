@@ -164,7 +164,39 @@ def _new_conn(ext_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.enable_load_extension(True)
     conn.load_extension(str(ext_path))
+    _install_deterministic_random(conn)
     return conn
+
+
+def _install_deterministic_random(conn: sqlite3.Connection) -> None:
+    """Override SQLite's built-in random() with a deterministic LCG so
+    that TCK scenarios using `rand()` (which transforms to
+    `ABS(RANDOM())/...`) produce the same sequence every run.
+
+    Several openCypher Quantifier and Comprehension scenarios test
+    tautologies of the form `any(P) = NOT all(NOT P)` while feeding
+    `rand()`-shuffled input lists. They're meant to be invariant
+    regardless of input — but a real bug in our implementation
+    surfaces only on certain inputs, so the flake hides it. Making
+    rand() deterministic per-connection turns the flake into a
+    consistent signal: either the test now consistently passes (no
+    real bug for this seed) or consistently fails (and we can
+    investigate the deterministic counterexample).
+
+    Seed is fixed; sequence resets when the harness creates a new
+    connection (i.e. between scenarios). LCG constants from Numerical
+    Recipes — full int64 cycle, no zero output."""
+    state = [0x5DEECE66D9F37C45]  # arbitrary fixed seed
+
+    def _random() -> int:
+        state[0] = (state[0] * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        # SQLite's random() returns a signed 64-bit; map our unsigned state
+        # into the signed range so ABS(RANDOM()) behaves as the extension
+        # expects.
+        v = state[0]
+        return v - (1 << 64) if v >= (1 << 63) else v
+
+    conn.create_function("random", 0, _random, deterministic=True)
 
 
 def _named_graph_file(name: str) -> Path | None:
