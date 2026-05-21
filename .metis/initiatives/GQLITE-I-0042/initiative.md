@@ -201,6 +201,28 @@ raw_output in its output.
 - **E3**: Move the equivalent calls in `cypher_transform_query` to a
   single canonical location. Remove the drain shim.
 
+**E2 attempt 2026-05-20 — NOT safe in isolation.** Attempting just E2
+(removing finalize from `transform_return.c` and adding an unconditional
+finalize at end of `transform_single_query_sql`) crashed TCK pass from
+3422 to 854 with widespread "incomplete input" errors. Root cause:
+`transform_single_query_sql` is invoked by multiple contexts — write-
+only queries, CALL subqueries via `executor_call_subquery.c`, MERGE
+pipelines, UNION branches — and not all expect finalize at that
+boundary. A blanket finalize at the end of the clause loop breaks the
+contexts that add to the builder afterward.
+
+**Correct ordering for next session:**
+1. E4 (`handle_match_delete` two-pass) — cleanest pilot
+2. E5 (`handle_match_set` two-pass) — unblocks T-0297
+3. E6 (`handle_match_remove` two-pass)
+4. E7 (`handle_call_subquery`), E8 (MERGE) — most complex, last
+5. THEN E2/E3 — once executors no longer rely on mid-flow finalize,
+   relocating it is safe.
+
+E1 (idempotent `sql_builder_to_string`) is committed and the
+auto-unfinalize wrapper in `finalize_sql_generation` preserves the
+multi-call pattern existing executor handlers depend on.
+
 ### Phase 3 — Two-pass handlers
 
 - **E4**: `handle_match_delete` — extract intermediate-MATCH step into
