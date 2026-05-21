@@ -77,6 +77,22 @@ static const char *find_aggregating_call(ast_node *expr)
                 if (r) return r;
             }
         }
+    } else if (expr->type == AST_NODE_MAP) {
+        cypher_map *m = (cypher_map*)expr;
+        if (m->pairs) {
+            for (int i = 0; i < m->pairs->count; i++) {
+                cypher_map_pair *mp = (cypher_map_pair*)m->pairs->items[i];
+                if (mp) {
+                    const char *r = find_aggregating_call(mp->value);
+                    if (r) return r;
+                }
+            }
+        }
+    } else if (expr->type == AST_NODE_SUBSCRIPT) {
+        cypher_subscript *s = (cypher_subscript*)expr;
+        const char *r = find_aggregating_call(s->expr);
+        if (r) return r;
+        return find_aggregating_call(s->index);
     }
     return NULL;
 }
@@ -464,6 +480,14 @@ int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
             ctx->sql_size = saved_size;
             strcpy(ctx->sql_buffer, saved_buffer);
             free(saved_buffer);
+
+            /* Check for nested aggregates (e.g. `age + count(x)` or
+             * `{kids: collect(x)}`). Without this, the implicit GROUP BY
+             * isn't emitted and a grouped-aggregate-on-empty produces 1
+             * all-null row instead of 0 rows. (With6 [6]/[7].) */
+            if (find_aggregating_call(item->expr) != NULL) {
+                has_aggregate = true;
+            }
         }
     }
 
