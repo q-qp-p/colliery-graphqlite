@@ -361,6 +361,16 @@ int transform_unwind_clause(cypher_transform_context *ctx, cypher_unwind *unwind
          * the carry-cols must reference those original aliases too. */
         bool splicable = (inner_sql && strlen(inner_sql) > 0 &&
             strncmp(inner_sql, "SELECT * FROM ", 14) == 0);
+        /* When inner_sql has a WHERE clause, we need to splice the FROM
+         * tables BEFORE the comma + json_each(...) and emit the WHERE
+         * AFTER the join. Reproducer: Graph8 [5]
+         *   MATCH ()-[r:KNOWS]-() UNWIND keys(r) AS x ...
+         * Previously emitted `... WHERE <conds>, json_each(...)` which
+         * misplaces the comma. */
+        const char *where_in_inner = NULL;
+        if (splicable) {
+            where_in_inner = strstr(inner_sql, " WHERE ");
+        }
         dbuf_append(&cte_query, "SELECT json_each.value AS value");
         if (has_carry) {
             dbuf_append(&cte_query,
@@ -370,13 +380,25 @@ int transform_unwind_clause(cypher_transform_context *ctx, cypher_unwind *unwind
 
         if (inner_sql && strlen(inner_sql) > 0) {
             if (splicable) {
-                dbuf_appendf(&cte_query, "%s, ", inner_sql + 14);
+                if (where_in_inner) {
+                    /* Emit just the FROM tables (between "SELECT * FROM "
+                     * and the " WHERE "), then the json_each, then re-attach
+                     * WHERE afterwards. */
+                    size_t tables_len = (size_t)(where_in_inner - (inner_sql + 14));
+                    dbuf_appendf(&cte_query, "%.*s, ", (int)tables_len, inner_sql + 14);
+                } else {
+                    dbuf_appendf(&cte_query, "%s, ", inner_sql + 14);
+                }
             } else {
                 dbuf_appendf(&cte_query, "(%s) AS _prev, ", inner_sql);
             }
         }
 
         dbuf_appendf(&cte_query, "json_each(%s)", func_sql);
+        if (splicable && where_in_inner) {
+            /* WHERE keyword is included in where_in_inner (" WHERE ..."). */
+            dbuf_append(&cte_query, where_in_inner);
+        }
         free(func_sql);
     } else if (unwind->expr->type == AST_NODE_PARAMETER) {
         /* Parameter reference: use json_each on the bound parameter value.
