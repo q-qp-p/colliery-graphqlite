@@ -950,14 +950,32 @@ static int check_ambiguous_aggregation(const ast_node *expr,
 
 /* Recursive walker for ORDER BY: accept if every non-aggregate free
  * reference is in `available` or, in property-path form,
- * `available_props`. Skips inside aggregate calls. */
+ * `available_props`. Skips inside aggregate calls — but the aggregate
+ * itself must be one whose function name appears in the projection
+ * (passed as `projected_agg_names`); otherwise it's a "new" aggregate
+ * which is invalid in restricted mode. */
 static int order_by_walk_check(const ast_node *expr,
                                const name_set *available,
                                const name_set *available_props,
+                               const name_set *projected_agg_names,
                                char **error_message)
 {
     if (!expr) return 0;
-    if (ast_is_aggregate_func(expr)) return 0;  /* inside-agg is fine */
+    if (ast_is_aggregate_func(expr)) {
+        /* WithOrderBy4 [13]/[14]: ORDER BY introduces a NEW aggregate
+         * not present in the projection. Per spec, ORDER BY in restricted
+         * mode can only re-use projection-aggregates. */
+        const cypher_function_call *fc = (const cypher_function_call *)expr;
+        if (fc->function_name && projected_agg_names &&
+            !nset_contains(projected_agg_names, fc->function_name)) {
+            set_error(error_message,
+                "SyntaxError: UndefinedVariable: ORDER BY introduces aggregate `%s` "
+                "that is not in the projection",
+                fc->function_name);
+            return -1;
+        }
+        return 0;
+    }
     if (expr->type == AST_NODE_IDENTIFIER) {
         const char *n = ((const cypher_identifier *)expr)->name;
         if (!nset_contains(available, n)) {
@@ -979,29 +997,29 @@ static int order_by_walk_check(const ast_node *expr,
             if (nset_contains(available_props, path)) return 0;
         }
         /* Otherwise recurse into the base. */
-        return order_by_walk_check(p->expr, available, available_props, error_message);
+        return order_by_walk_check(p->expr, available, available_props, projected_agg_names, error_message);
     }
     switch (expr->type) {
         case AST_NODE_BINARY_OP: {
             const cypher_binary_op *b = (const cypher_binary_op *)expr;
-            if (order_by_walk_check(b->left, available, available_props, error_message) < 0) return -1;
-            return order_by_walk_check(b->right, available, available_props, error_message);
+            if (order_by_walk_check(b->left, available, available_props, projected_agg_names, error_message) < 0) return -1;
+            return order_by_walk_check(b->right, available, available_props, projected_agg_names, error_message);
         }
         case AST_NODE_NOT_EXPR:
-            return order_by_walk_check(((const cypher_not_expr *)expr)->expr, available, available_props, error_message);
+            return order_by_walk_check(((const cypher_not_expr *)expr)->expr, available, available_props, projected_agg_names, error_message);
         case AST_NODE_FUNCTION_CALL: {
             const cypher_function_call *f = (const cypher_function_call *)expr;
             if (f->args) {
                 for (int i = 0; i < f->args->count; i++) {
-                    if (order_by_walk_check(f->args->items[i], available, available_props, error_message) < 0) return -1;
+                    if (order_by_walk_check(f->args->items[i], available, available_props, projected_agg_names, error_message) < 0) return -1;
                 }
             }
             return 0;
         }
         case AST_NODE_SUBSCRIPT: {
             const cypher_subscript *s = (const cypher_subscript *)expr;
-            if (order_by_walk_check(s->expr, available, available_props, error_message) < 0) return -1;
-            return order_by_walk_check(s->index, available, available_props, error_message);
+            if (order_by_walk_check(s->expr, available, available_props, projected_agg_names, error_message) < 0) return -1;
+            return order_by_walk_check(s->index, available, available_props, projected_agg_names, error_message);
         }
         default:
             return 0;
@@ -1047,6 +1065,11 @@ static int validate_order_by_with_projection(ast_list *order_by,
      * `available_props` as "base.prop" strings. */
     name_set available; nset_init(&available);
     name_set available_props; nset_init(&available_props);
+    /* Aggregate function names that appear at top-level in the
+     * projection. ORDER BY may only repeat aggregates that match
+     * these names; introducing a new aggregate (sum(x) when
+     * projection has min(x)) is invalid. */
+    name_set projected_agg_names; nset_init(&projected_agg_names);
     /* Storage for synthesized "base.prop" strings — kept alive while
      * we run the order-by walk, then freed below. */
     char **prop_storage = NULL;
@@ -1075,16 +1098,24 @@ static int validate_order_by_with_projection(ast_list *order_by,
                 }
             }
         }
+        /* Catch top-level aggregate calls in the projection — their
+         * function name is what ORDER BY is allowed to reuse. */
+        if (ast_is_aggregate_func(it->expr)) {
+            const cypher_function_call *fc = (const cypher_function_call *)it->expr;
+            if (fc->function_name) nset_add(&projected_agg_names, fc->function_name);
+        }
     }
 
     int rc = 0;
     for (int i = 0; i < order_by->count && rc == 0; i++) {
         cypher_order_by_item *obi = (cypher_order_by_item *)order_by->items[i];
         if (!obi || !obi->expr) continue;
-        rc = order_by_walk_check(obi->expr, &available, &available_props, error_message);
+        rc = order_by_walk_check(obi->expr, &available, &available_props,
+                                  &projected_agg_names, error_message);
     }
     nset_free(&available);
     nset_free(&available_props);
+    nset_free(&projected_agg_names);
     for (int i = 0; i < prop_storage_count; i++) free(prop_storage[i]);
     free(prop_storage);
     return rc;
