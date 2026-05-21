@@ -661,6 +661,28 @@ static int transform_match_pattern(cypher_transform_context *ctx, ast_node *patt
                             }
                         }
                         need_from_clause = false; /* Don't add nodes table */
+
+                        /* T-0307: when re-binding a WITH-bound variable with
+                         * additional label predicates (e.g. `WITH a1 MATCH
+                         * (a1:X)`), the label check must still be enforced.
+                         * Previously the entire node attach was skipped,
+                         * silently dropping the predicate. Emit each label
+                         * as an EXISTS WHERE condition against node_labels. */
+                        if (has_labels(node)) {
+                            const char *graph_prefix = ctx->current_graph ? ctx->current_graph : "";
+                            for (int li = 0; li < node->labels->count; li++) {
+                                const char *label = get_label_string(node->labels->items[li]);
+                                if (!label) continue;
+                                char *esc_label = escape_sql_string(label);
+                                char where_buf[512];
+                                snprintf(where_buf, sizeof(where_buf),
+                                    "EXISTS (SELECT 1 FROM %snode_labels WHERE node_id = %s AND label = '%s')",
+                                    graph_prefix, alias,
+                                    esc_label ? esc_label : label);
+                                free(esc_label);
+                                sql_where(ctx->unified_builder, where_buf);
+                            }
+                        }
                     } else {
                         /* Regular variable - reuse alias, check if we need FROM clause */
                         alias = transform_var_get_alias(ctx->var_ctx, node->variable);
