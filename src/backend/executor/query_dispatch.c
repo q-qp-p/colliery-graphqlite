@@ -796,7 +796,17 @@ static int handle_match_remove(cypher_executor *executor, cypher_query *query,
         if (flags & CLAUSE_RETURN) {
             cypher_return *ret = find_return_clause(query);
             if (ret) {
-                rc = execute_match_return_query(executor, match, ret, result);
+                /* Same stale-WHERE issue as MATCH+SET (I-0042 E5/E6 light):
+                 * REMOVE may have stripped a label/property the WHERE was
+                 * filtering on. Synth a match without WHERE so the re-MATCH
+                 * finds the (post-REMOVE) entities by structure. */
+                cypher_match *synth = make_cypher_match(match->pattern,
+                                                       NULL,
+                                                       match->optional,
+                                                       match->from_graph);
+                rc = execute_match_return_query(executor,
+                    synth ? synth : match, ret, result);
+                if (synth) free(synth);
             }
         }
     }
