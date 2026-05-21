@@ -1,18 +1,18 @@
 ---
 id: unwind-after-with-loses-list
 level: task
-title: "UNWIND after WITH loses list variables — \"_prev.X\" column missing"
+title: "UNWIND after WITH loses list variables — "_prev.X" column missing"
 short_code: "GQLITE-T-0305"
 created_at: 2026-05-21T01:58:37.141580+00:00
-updated_at: 2026-05-21T01:58:37.141580+00:00
+updated_at: 2026-05-21T02:30:09.208679+00:00
 parent: 
 blocked_by: []
 archived: false
 
 tags:
   - "#task"
-  - "#phase/backlog"
   - "#bug"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -61,9 +61,31 @@ reproducer above.
 
 ## Acceptance Criteria
 
-- [ ] Reproducer query returns rows without "_prev.types" error
-- [ ] No regression on existing UNWIND-after-WITH scenarios
-- [ ] At least the 6 TCK scenarios above flip from error → pass/fail
+- [x] Reproducer `WITH 5 AS x UNWIND range(0, 2) AS i RETURN x, i` works
+- [x] No regression on existing UNWIND-after-WITH scenarios (944/944 unit, functional clean)
+- [x] TCK delta: +3 net pass, -6 errors (3422 → 3425, 110 → 104)
+
+## Status Updates
+
+**2026-05-21** — Completed in commit d828ec8.
+
+Root cause was as hypothesized but the carry-projection bug was in the
+function-call / subscript / binary-op branch, not the list-literal
+branch. When the unwound expression is a function call (e.g. `range()`),
+`transform_unwind.c` splices the prior FROM tables directly:
+```
+FROM _with_0, json_each(<func_sql>)
+```
+rather than wrapping them as `(SELECT * FROM _with_0) AS _prev`. The
+splice is intentional — it keeps outer variable refs in `<func_sql>`
+in scope. But the carry-cols snippet was hardcoded to emit `_prev.x AS x`,
+which has no matching alias in the spliced FROM.
+
+Fix: build a second carry-cols buffer (`carry_cols_orig`) that uses
+each carried variable's original `<table>.<col>` alias, and select
+between the two forms based on whether the branch splices or wraps.
+The wrapping branches (LIST literal, PROPERTY, IDENTIFIER, PARAMETER)
+keep using the `_prev.x` form.
 
 ## Discovered
 
