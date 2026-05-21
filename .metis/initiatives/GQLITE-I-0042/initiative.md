@@ -223,6 +223,67 @@ E1 (idempotent `sql_builder_to_string`) is committed and the
 auto-unfinalize wrapper in `finalize_sql_generation` preserves the
 multi-call pattern existing executor handlers depend on.
 
+### E5 (handle_match_set two-pass) — design sketch for next attempt
+
+The Set1 [1] / Set2 [2] family currently fails because:
+
+```
+MATCH (n:A) WHERE n.name = 'Andres' SET n.name = 'Michael' RETURN n
+                                                            ^
+              re-MATCHes from scratch — but n.name no longer matches WHERE
+```
+
+`handle_match_set` (query_dispatch.c:696) currently:
+1. Single-MATCH: calls `execute_match_set_query(executor, match, set, result)`.
+   That function transforms MATCH → executes per-row → applies SET per row,
+   discarding each row's `variable_map` after use.
+2. Multi-MATCH: calls `bind_match_clause_into_varmap` for each MATCH (collecting
+   IDs into `ms_vars`), then `execute_set_operations`.
+3. For RETURN: BOTH paths then call `execute_match_return_query(executor,
+   match, ret, result)` — which re-runs the original MATCH + WHERE.
+
+Two-pass refactor:
+
+```c
+// Always pre-capture IDs (Pass 1) — works for both single and multi MATCH
+variable_map *ms_vars = create_variable_map();
+for each MATCH clause:
+    bind_match_clause_into_varmap(executor, clause, ms_vars, result);
+// Pass 2a: SET using captured IDs
+execute_set_operations(executor, set, ms_vars, result);
+// Pass 2b: RETURN by ID, NOT by re-MATCHing the original WHERE
+if (RETURN present):
+    // NEW helper: execute_return_by_var_map(executor, match, ret, ms_vars, result)
+    // — fetch nodes/edges by ID from ms_vars (now reflecting post-SET state)
+    //   and project per the original RETURN
+```
+
+The Pass 2b helper is the new piece. Implementation options:
+- (a) Synthesize a `cypher_match` with `WHERE id(n) IN [<captured>]` and
+  call execute_match_return_query. Requires AST construction for the
+  WHERE which is awkward.
+- (b) Build SQL directly: for each captured ID, fetch from nodes/edges
+  table and emit via the standard projection path. Bypasses the
+  re-MATCH machinery entirely.
+- (c) Extend `execute_match_return_query` with an optional var_map
+  parameter — when provided, inject `<alias>.id IN (...)` into the
+  WHERE and SKIP the original WHERE. Less invasive than (a).
+
+Option (c) seems best. Same pattern should apply to T-0297 (C12 pre-SET
+var_map capture) and to handle_match_delete's Return2 [14] failure
+("Do not fail when returning type of deleted relationships" — needs
+to return pre-DELETE state).
+
+### Cross-type order comparison (T-0308 — separate ticket)
+
+Repeated attempts to add type-class checks to LT/GT/LTE/GTE crashed
+with SIGABRT in WithWhere5 [1]-[4]. Both naive (re-transform operand
+N times in CASE) and capture-string (transform once into temp buffer,
+substitute) approaches crashed. Root cause involves `transform_property_access`
+touching context state (likely `pending_prop_joins` or alias counter)
+that ISN'T captured by ctx->sql_buffer swapping. Needs deeper
+investigation before another attempt.
+
 ### Phase 3 — Two-pass handlers
 
 - **E4**: `handle_match_delete` — extract intermediate-MATCH step into
