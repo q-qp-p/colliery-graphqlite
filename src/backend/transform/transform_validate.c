@@ -450,6 +450,27 @@ static int validate_expr(ast_node *expr, char **error_message)
             if (validate_expr(lp->predicate, error_message) < 0) return -1;
             return 0;
         }
+        case AST_NODE_LIST_COMPREHENSION: {
+            cypher_list_comprehension *lc = (cypher_list_comprehension *)expr;
+            /* Same type-mismatch check as list predicates: a homogeneously
+             * non-numeric literal list bound to the iteration variable
+             * makes arithmetic on it in WHERE / transform invalid. */
+            if (lc->variable && lc->list_expr) {
+                int t = list_homogeneous_literal_type(lc->list_expr);
+                if (t == LITERAL_STRING || t == LITERAL_BOOLEAN) {
+                    if (lc->where_expr &&
+                        check_numeric_var_misuse(lc->where_expr, lc->variable, t, error_message) < 0)
+                        return -1;
+                    if (lc->transform_expr &&
+                        check_numeric_var_misuse(lc->transform_expr, lc->variable, t, error_message) < 0)
+                        return -1;
+                }
+            }
+            if (validate_expr(lc->list_expr, error_message) < 0) return -1;
+            if (lc->where_expr && validate_expr(lc->where_expr, error_message) < 0) return -1;
+            if (lc->transform_expr && validate_expr(lc->transform_expr, error_message) < 0) return -1;
+            return 0;
+        }
         case AST_NODE_NULL_CHECK: {
             cypher_null_check *nc = (cypher_null_check *)expr;
             return validate_expr(nc->expr, error_message);
