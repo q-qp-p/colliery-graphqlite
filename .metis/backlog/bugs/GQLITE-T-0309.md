@@ -108,6 +108,50 @@ fix. ~22 error scenarios share this root cause.
 - [ ] 22 `_gql_default_alias` errors in TCK flip to pass (or to a
   different fail).
 
+## Iter 39 attempt — partial: projector fixed, result-renderer still wrong
+
+Implemented the projector branch:
+- transform_match.c (line ~1145, inside the `rel->varlen` block):
+  call `transform_var_set_cte(ctx->var_ctx, rel->variable, cte_name)`
+  to stamp the varlen rel variable.
+- transform_return.c (line ~956): when projecting an edge variable
+  whose `cte_name` is set, emit
+  `(SELECT json_group_array(json_object(...)) FROM edges e WHERE e.id IN (json_each path_ids) ORDER BY instr(...))`
+  instead of the single-edge JSON template.
+
+Verified the **generated SQL is correct**: it prepares and runs (no
+more "no such column" errors). But the rendered result is still wrong:
+
+```
+MATCH (a)-[r*1..1]->(b) RETURN r
+=> [{"r": {"id": 0, "type": "", "startNode": 0, "endNode": 0, "properties": {}}}]
+   (one row, edge object with all-zero fields)
+```
+
+Expected:
+
+```
+=> [{"r": [{"id": 1, "type": "T", "startNodeId": ..., "endNodeId": ..., "properties": {}}]}]
+   (one row, value is a JSON array with one edge object)
+```
+
+Root cause of the residual: **build_query_results in
+executor_match.c reads the variable kind from the RETURN AST and
+re-fetches edges by id from the column's integer value**. It doesn't
+know to treat varlen-bound edge variables as already-rendered JSON
+arrays. The fetch path is in `executor_result_project.c` around
+line 425 (`edge_id >= 0` branch).
+
+The complete fix needs:
+1. The projector branch (done in iter 39, reverted because it doesn't
+   help alone).
+2. Detect varlen-bound edge vars in `build_query_results` and skip
+   the per-edge-id re-fetch — use the column's text value verbatim
+   as the JSON array.
+
+Reverted iter 39 because partial fix leaves TCK identical with extra
+churn. Full fix is the next attempt.
+
 ## Discovered
 
 2026-05-21 during iteration 38 of the open-work queue, dumping the
