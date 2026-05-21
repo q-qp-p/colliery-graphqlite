@@ -1614,20 +1614,31 @@ static int check_undef_in_expr(ast_node *expr, const name_set *bound,
 }
 
 /* Walk every property-map value in a CREATE/MERGE pattern checking for
- * identifier references that aren't bound. Pattern variables being
- * introduced by this same clause are NOT in `bound` yet — that matches
- * Cypher scoping (you can't reference a sibling variable being
- * introduced in the same write clause). */
+ * identifier references that aren't bound. Per openCypher: variables
+ * bound in an earlier path of the same CREATE are in scope for later
+ * paths. We process paths in order and merge each path's bindings
+ * into a local copy of `bound` before validating the next path —
+ * forward references work, backward references don't. (With2 [1],
+ * WithSkipLimit1 [1].) */
 static int validate_write_undef_in_props(ast_list *patterns, const name_set *bound,
                                          const char *kw, char **error_message)
 {
     if (!patterns) return 0;
+    /* Local name set seeded with the inherited bound vars, extended
+     * as we walk each path. */
+    name_set local_bound; nset_init(&local_bound);
+    if (bound) {
+        for (int i = 0; i < bound->count; i++) {
+            if (bound->names[i]) nset_add(&local_bound, bound->names[i]);
+        }
+    }
+    int rc = 0;
     for (int pi = 0; pi < patterns->count; pi++) {
         ast_node *pn = patterns->items[pi];
         if (!pn || pn->type != AST_NODE_PATH) continue;
         cypher_path *p = (cypher_path *)pn;
         if (!p->elements) continue;
-        for (int ei = 0; ei < p->elements->count; ei++) {
+        for (int ei = 0; ei < p->elements->count && rc == 0; ei++) {
             ast_node *el = p->elements->items[ei];
             if (!el) continue;
             ast_node *props = NULL;
@@ -1636,14 +1647,30 @@ static int validate_write_undef_in_props(ast_list *patterns, const name_set *bou
             if (!props || props->type != AST_NODE_MAP) continue;
             cypher_map *m = (cypher_map *)props;
             if (!m->pairs) continue;
-            for (int i = 0; i < m->pairs->count; i++) {
+            for (int i = 0; i < m->pairs->count && rc == 0; i++) {
                 cypher_map_pair *pair = (cypher_map_pair *)m->pairs->items[i];
                 if (!pair || !pair->value) continue;
-                if (check_undef_in_expr(pair->value, bound, kw, error_message) < 0) return -1;
+                if (check_undef_in_expr(pair->value, &local_bound, kw, error_message) < 0) rc = -1;
+            }
+        }
+        /* Now add this path's bindings so later paths can reference them. */
+        if (rc == 0 && p->var_name) nset_add(&local_bound, p->var_name);
+        if (rc == 0) {
+            for (int ei = 0; p->elements && ei < p->elements->count; ei++) {
+                ast_node *el = p->elements->items[ei];
+                if (!el) continue;
+                if (el->type == AST_NODE_NODE_PATTERN) {
+                    cypher_node_pattern *np = (cypher_node_pattern *)el;
+                    if (np->variable) nset_add(&local_bound, np->variable);
+                } else if (el->type == AST_NODE_REL_PATTERN) {
+                    cypher_rel_pattern *rp = (cypher_rel_pattern *)el;
+                    if (rp->variable) nset_add(&local_bound, rp->variable);
+                }
             }
         }
     }
-    return 0;
+    nset_free(&local_bound);
+    return rc;
 }
 
 /* Reject NULL literals in CREATE/MERGE property maps. openCypher
