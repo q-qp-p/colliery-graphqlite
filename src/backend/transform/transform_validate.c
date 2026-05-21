@@ -1108,6 +1108,23 @@ static int validate_match_clause(cypher_match *match, const var_type_ctx *vctx,
 {
     if (!match) return 0;
     if (match->where) {
+        /* Pattern1 [11]: `MATCH (n) WHERE (n) RETURN n`. After paren
+         * stripping the WHERE expression is the bare identifier `n`,
+         * which is a Node — not a valid Boolean predicate. Raise
+         * InvalidArgumentType. */
+        if (match->where->type == AST_NODE_IDENTIFIER) {
+            cypher_identifier *id = (cypher_identifier *)match->where;
+            var_type vt = vctx_lookup(vctx, id->name);
+            if (vt == VTYPE_NODE || vt == VTYPE_EDGE || vt == VTYPE_PATH) {
+                char buf[200];
+                snprintf(buf, sizeof(buf),
+                         "SyntaxError: InvalidArgumentType: Type mismatch: expected Boolean but was %s",
+                         vt == VTYPE_NODE ? "Node" :
+                         vt == VTYPE_EDGE ? "Relationship" : "Path");
+                set_error(error_message, "%s", buf);
+                return -1;
+            }
+        }
         if (validate_expr(match->where, error_message) < 0) return -1;
         if (validate_expr_typed(match->where, vctx, error_message) < 0) return -1;
     }
@@ -1180,6 +1197,30 @@ static int validate_where_pattern_vars(ast_node *expr, const name_set *bound,
     if (expr->type == AST_NODE_EXISTS_EXPR) {
         cypher_exists_expr *ex = (cypher_exists_expr *)expr;
         if (ex->expr_type == EXISTS_TYPE_PATTERN && ex->expr.pattern) {
+            /* Pattern1 [11]: `WHERE (n)` — pattern predicate with a
+             * single-node path (no relationships). openCypher requires
+             * pattern predicates to have at least one relationship;
+             * otherwise the predicate is meaningless ("does n exist?"
+             * but n is already bound by MATCH). Raise InvalidArgumentType. */
+            for (int i = 0; i < ex->expr.pattern->count; i++) {
+                ast_node *path_node = ex->expr.pattern->items[i];
+                if (path_node && path_node->type == AST_NODE_PATH) {
+                    cypher_path *p = (cypher_path *)path_node;
+                    int rel_count = 0;
+                    if (p->elements) {
+                        for (int j = 0; j < p->elements->count; j++) {
+                            ast_node *el = p->elements->items[j];
+                            if (el && el->type == AST_NODE_REL_PATTERN) rel_count++;
+                        }
+                    }
+                    if (rel_count == 0) {
+                        set_error(error_message,
+                                  "SyntaxError: InvalidArgumentType: "
+                                  "pattern predicate in WHERE must contain at least one relationship");
+                        return -1;
+                    }
+                }
+            }
             for (int i = 0; i < ex->expr.pattern->count; i++) {
                 if (validate_where_pattern_vars(ex->expr.pattern->items[i], bound, error_message) < 0) return -1;
             }
@@ -1764,9 +1805,12 @@ int transform_validate_query(cypher_query *query, char **error_message)
             }
             case AST_NODE_MATCH: {
                 cypher_match *m = (cypher_match *)clause;
-                rc = validate_match_clause(m, &vctx, error_message);
+                /* Register the MATCH pattern's variable types BEFORE
+                 * validating its WHERE expression, so type-aware checks
+                 * (e.g. "WHERE n where n is a node") can see n's type. */
                 collect_pattern_names(m->pattern, &bound);
                 register_pattern_kinds(m->pattern, &vctx);
+                rc = validate_match_clause(m, &vctx, error_message);
                 /* WHERE patterns may not introduce fresh variables — every
                  * var in a pattern predicate must already be bound. Run
                  * after collect_pattern_names so the current MATCH's own
